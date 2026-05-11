@@ -73,7 +73,7 @@ def get_latency(keyword):
         folders = [f for f in os.listdir(group_path) if os.path.isdir(os.path.join(group_path, f))]
         
         # 폴더명(예: "sha-256", "poseidon2")이 keyword를 포함하는지 확인
-        target_folder = next((f for f in folders if keyword.lower() in f.replace("-", "").lower()), None)
+        target_folder = next((f for f in folders if keyword.replace("-", "").lower() in f.replace("-", "").lower()), None)
         
         if target_folder:
             json_path = os.path.join(group_path, target_folder, "new", "estimates.json")
