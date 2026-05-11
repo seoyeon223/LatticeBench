@@ -29,4 +29,6 @@ fn main() {
         height_large, 
         height_large.ilog2()
     );
+    
+    println!("Trace Size: {}", total_cells);
 }

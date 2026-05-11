@@ -38,4 +38,5 @@ fn main() {
         trace_matrix_large.height(), 
         trace_matrix_large.height().ilog2()
     );
+    println!("Trace Size: {}", total_cells);
 }
