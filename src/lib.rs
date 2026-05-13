@@ -152,3 +152,4 @@ mod tests {
         assert_eq!(result2.coeffs[2], 15);
     }
 }
+pub mod sha256;

@@ -21,15 +21,21 @@ p3-air = { git = "https://github.com/Plonky3/Plonky3.git" }
 p3-sha256 = { git = "https://github.com/Plonky3/Plonky3.git" } # Plonky3의 SHA-256
 p3-poseidon2-air = { git = "https://github.com/Plonky3/Plonky3" }
 p3-goldilocks = { git = "https://github.com/Plonky3/Plonky3" }
+
 sha2 = "0.10" # 네이티브 SHA-256 해시 비교용
 dhat = "0.3"
-rand = "0.10"
+rand = "0.10.1"
 num-traits = "0.2.19"
+p3-merkle-tree = { git = "https://github.com/Plonky3/Plonky3.git", version = "0.5.1" }
+p3-dft = { git = "https://github.com/Plonky3/Plonky3.git", version = "0.5.1" }
+p3-fri = { git = "https://github.com/Plonky3/Plonky3.git", version = "0.5.1" }
+p3-challenger = { git = "https://github.com/Plonky3/Plonky3.git", version = "0.5.1" }
+p3-uni-stark = { git = "https://github.com/Plonky3/Plonky3.git", version = "0.5.1" }
 
 [dev-dependencies]
 criterion = "0.5"
 pprof = { version = "0.13", features = ["flamegraph", "criterion"] }
-rand = "0.10"
+rand = "0.10.1"
 rand_chacha = "0.3"
 
 [[bench]]

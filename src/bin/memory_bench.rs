@@ -10,6 +10,8 @@ use lattice_bench::{SwifftHasher, SwifftPoly};
 use std::fs::File;
 use std::io::Write;
 use std::collections::HashMap;
+use rand::SeedableRng;
+use rand::rngs::StdRng;
 
 // 글로벌 할당자 등록
 #[global_allocator]
@@ -55,7 +57,9 @@ fn main() {
     // ----------------------------------------------------
     let stats_before = HeapStats::get();
     {
+        // 최신 rand 0.10.1 문법인 rand::rng()를 사용합니다.
         let mut rng = rand::rng(); 
+        
         let poseidon_perm = Poseidon2BabyBear::<16>::new_from_rng_128(&mut rng);
         let hasher = PaddingFreeSponge::<_, 16, 8, 4>::new(poseidon_perm);
         
@@ -63,8 +67,6 @@ fn main() {
         let _hash = hasher.hash_iter(data.iter().cloned());
     }
     let stats_after = HeapStats::get();
-    let poseidon_mem_kb = (stats_after.total_bytes - stats_before.total_bytes) as f64 / 1024.0;
-    results.insert("Poseidon", poseidon_mem_kb);
 
     // ----------------------------------------------------
     // 4. SWIFFT 측정 (격자 다항식 단위)

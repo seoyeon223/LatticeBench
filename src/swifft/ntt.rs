@@ -37,16 +37,10 @@ pub fn mod_exp(mut base: i32, mut exp: usize) -> i32 {
 
 /// 비트 반전 (Bit-reversal) 로직
 /// 인덱스 0~63의 이진수 비트 배열을 뒤집습니다. (예: 000001 -> 100000)
-fn reverse_bits(n: usize, bits: usize) -> usize {
-    let mut res = 0;
-    for i in 0..bits {
-        if (n >> i) & 1 == 1 {
-            res |= 1 << (bits - 1 - i);
-        }
-    }
-    res
+fn reverse_bits(n: usize, bits: u32) -> usize {
+    // usize의 전체 비트를 뒤집은 뒤, 우리가 필요한 비트 수만큼만 오른쪽으로 시프트
+    n.reverse_bits() >> (usize::BITS - bits)
 }
-
 /// Cooley-Tukey 기반 64-point NTT 및 Inverse NTT 알고리즘
 pub fn ntt(a: &mut [i32; N], inverse: bool) {
     // 1. Bit-reversal Permutation (입력 재배치)
