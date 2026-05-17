@@ -1,5 +1,14 @@
 // lattice-bench/src/lib.rs
 
+//swifft 사용
+pub mod swifft;
+
+// 모듈의 구조체들을 crate 최상단에서 사용할 수 있도록 재수출(re-export)
+pub use swifft::naive::{SwifftHasherNaive, SwifftPolyNaive};
+pub use swifft::ntt::SwifftHasherNTT;
+pub use swifft::simd::SwifftHasherSimd;
+
+
 /// SWIFFT에서 사용하는 모듈러스 (q = 257)
 pub const SWIFFT_MODULUS: u16 = 257;
 

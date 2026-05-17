@@ -1,6 +1,8 @@
 // src/swifft/mod.rs
 
-pub mod ntt; // 하위 모듈인 ntt.rs를 공개적으로 포함
+pub mod ntt;   // 하위 모듈인 ntt.rs를 공개적으로 포함
+pub mod naive; // 하위 모듈인 naive.rs를 공개적으로 포함
+pub mod simd;  // 하위 모듈인 simd.rs를 공개적으로 포함
 
 /// SWIFFT 알고리즘 규격 상수
 pub const M: usize = 16;   // 입력 블록을 나누는 개수 (사용되는 다항식의 수)
@@ -25,17 +27,17 @@ impl SwifftPoly {
     }
 }
 
-/// SWIFFT 해시 인스턴스 구조체
+/// SWIFFT 해시 인스턴스 구조체 (NTT 기반 스칼라 버전)
 /// 보안성 및 시스템 메모리 효율성을 고려하여 설계되었습니다.
 #[derive(Clone, Debug)]
-pub struct SwifftHasher {
+pub struct SwifftHasherNTT {
     /// 해시 함수의 '키(Key)' 역할을 하는 M개의 랜덤 다항식.
     /// [최적화 핵심] 매번 해시 연산을 수행할 때마다 키를 NTT 변환하는 것은 심각한 성능 저하를 초래합니다.
     /// 따라서 객체 생성 시점에 전처리(Weighting) 및 NTT 변환을 미리 수행하여 캐싱(Caching)해 둡니다.
     pub a_keys_ntt: [SwifftPoly; M],
 }
 
-impl SwifftHasher {
+impl SwifftHasherNTT {
     /// 새로운 SWIFFT 해시 인스턴스 생성 및 키 전처리
     /// raw_keys: 난수 발생기로 생성된 M개의 N차 다항식 배열
     pub fn new(raw_keys: &[[i32; N]; M]) -> Self {
@@ -60,6 +62,47 @@ impl SwifftHasher {
         Self { a_keys_ntt }
     }
 
-    /// (향후 구현될 부분) 입력된 바이트 배열을 해싱하는 메인 함수
-    /// pub fn hash(&self, input: &[u8]) -> [u8; 32] { ... }
+    /// NTT를 사용한 스칼라 방식의 해시 함수 (SIMD 미사용 버전)
+    pub fn hash(&self, input: &[u8]) -> SwifftPoly {
+        assert_eq!(input.len(), 256, "SWIFFT input must be 256 bytes");
+
+        // 결과를 누적할 NTT 도메인 배열
+        let mut result_ntt = [0i32; N];
+
+        for i in 0..M {
+            let mut x_poly = [0i32; N];
+            let chunk = &input[i * 16..(i + 1) * 16];
+            
+            // 1. 바이트 -> 계수 매핑 (비트 추출)
+            for j in 0..16 {
+                let byte = chunk[j];
+                for b in 0..4 {
+                    x_poly[j * 4 + b] = ((byte >> (b * 2)) & 0x03) as i32;
+                }
+            }
+
+            // 2. 입력 다항식 NTT 변환
+            ntt::ntt(&mut x_poly, false);
+
+            // 3. Pointwise Multiplication & Accumulate (스칼라 연산)
+            for k in 0..N {
+                // a_i * x_i mod 257
+                let term = ntt::mod_q(self.a_keys_ntt[i].coeffs[k] * x_poly[k]);
+                // 결과 누적
+                result_ntt[k] = ntt::mod_q(result_ntt[k] + term);
+            }
+        }
+
+        // 4. 역변환 (INTT)
+        ntt::ntt(&mut result_ntt, true);
+
+        // 5. Unweighting 후처리
+        let mut final_result = [0i32; N];
+        for j in 0..N {
+            let psi_inv_power = ntt::mod_exp(ntt::PSI_INV, j);
+            final_result[j] = ntt::mod_q(result_ntt[j] * psi_inv_power);
+        }
+
+        SwifftPoly::new(final_result)
+    }
 }

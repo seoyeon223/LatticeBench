@@ -1,1 +1,8 @@
-{"SHA-256": 16384, "Keccak": 674048, "Poseidon": 8192}
+{
+  "SHA-256": 16384,
+  "Keccak": 674048,
+  "Poseidon": 8192,
+  "SWIFFT-AVX2": 65536,
+  "SWIFFT-Naive": 65536,
+  "SWIFFT-Scalar": 65536
+}

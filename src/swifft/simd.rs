@@ -1,9 +1,11 @@
 // src/swifft/simd.rs
 
+// 🟢 파일 전체를 막지 않고, 필요한 부분(import)에만 x86 제한을 둡니다.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 use core::arch::x86_64::*;
+
 use crate::swifft::ntt;
-use crate::swifft::{SwifftPoly, M, N, Q};
+use crate::swifft::{SwifftPoly, M, N}; // Q는 사용되지 않으면 생략 가능
 
 #[derive(Clone, Debug)]
 pub struct SwifftHasherSimd {
@@ -26,6 +28,8 @@ impl SwifftHasherSimd {
     }
 
     /// AVX2를 활용하여 256바이트 입력을 초고속으로 해싱합니다.
+    /// 🟢 x86 환경에서만 컴파일되도록 제한
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     #[target_feature(enable = "avx2")]
     pub unsafe fn hash_avx2(&self, input: &[u8]) -> SwifftPoly {
         assert_eq!(input.len(), 256, "SWIFFT input must be 256 bytes");
@@ -82,37 +86,34 @@ impl SwifftHasherSimd {
         SwifftPoly::new(final_result)
     }
 
-    /// 안전한 외부 인터페이스 래퍼
+    /// 안전한 외부 인터페이스 래퍼 (어느 아키텍처에서든 호출은 가능하게 만듦)
     pub fn hash(&self, input: &[u8]) -> SwifftPoly {
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         {
-            if is_x86_feature_detected!("avx2") {
+            if std::is_x86_feature_detected!("avx2") {
                 return unsafe { self.hash_avx2(input) };
             }
         }
-        // AVX2 미지원 환경(예: ARM Mac)을 위한 Fallback 로직 (필요시 naive 구현 호출)
-        panic!("AVX2 is not supported on this architecture!");
+        
+        // 🟢 AVX2 미지원 환경(예: ARM Mac)을 위한 Fallback
+        // Mac에서는 SIMD가 동작하지 않으므로 에러를 발생시키거나 스칼라(NTT) 버전을 사용해야 합니다.
+        panic!("AVX2 is not supported on this architecture (e.g., Apple Silicon). Please use SwifftHasherNTT instead.");
     }
 }
 
 /// AVX2 레지스터 기반 초고속 곱셈 및 모듈러 257 연산 (c = a * b mod 257)
-#[inline(always)]
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
 unsafe fn fast_mul_mod_257_avx2(a: __m256i, b: __m256i) -> __m256i {
-    // 1. c = a * b (하위 32비트 유지)
     let c = _mm256_mullo_epi32(a, b);
 
-    // 2. L = c & 0xFF
     let mask_ff = _mm256_set1_epi32(0xFF);
     let l = _mm256_and_si256(c, mask_ff);
 
-    // 3. H = c >> 8
     let h = _mm256_srli_epi32(c, 8);
 
-    // 4. R = L - H
     let mut r = _mm256_sub_epi32(l, h);
 
-    // 5. if R < 0 { R += 257 }
     let zero = _mm256_setzero_si256();
     let is_negative = _mm256_cmpgt_epi32(zero, r); // zero > r => r < 0
     let q_mask = _mm256_and_si256(is_negative, _mm256_set1_epi32(257));
@@ -122,7 +123,7 @@ unsafe fn fast_mul_mod_257_avx2(a: __m256i, b: __m256i) -> __m256i {
 }
 
 /// AVX2 레지스터 기반 덧셈 보정 연산
-#[inline(always)]
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
 unsafe fn fast_mod_257_add_avx2(sum: __m256i) -> __m256i {
     let q_vec = _mm256_set1_epi32(257);

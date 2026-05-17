@@ -1,6 +1,8 @@
 {
-  "SHA-256": 1.00,
-  "Keccak": 1.00,
-  "Poseidon": 1.88,
-  "SWIFFT": 0.00
+  "Keccak": 0.00,
+  "SHA-256": 0.00,
+  "Poseidon": 1.55,
+  "SWIFFT-Naive": 0.00,
+  "SWIFFT-Scalar": 0.00,
+  "SWIFFT-AVX2": 0.00
 }

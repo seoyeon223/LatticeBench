@@ -4,94 +4,149 @@ use p3_sha256::Sha256;
 use p3_symmetric::CryptographicHasher;
 
 use p3_baby_bear::{BabyBear, Poseidon2BabyBear}; 
-use p3_symmetric::{PaddingFreeSponge};
-use lattice_bench::{SwifftHasher, SwifftPoly};
+use p3_symmetric::PaddingFreeSponge;
 
 use std::fs::File;
 use std::io::Write;
 use std::collections::HashMap;
+use std::hint::black_box;
+
+// 🟢 고정된 시드의 난수를 생성하기 위해 StdRng 사용 (에러 완벽 해결)
 use rand::SeedableRng;
 use rand::rngs::StdRng;
+
+use lattice_bench::{SwifftHasherNaive, SwifftPolyNaive};
+use lattice_bench::swifft::SwifftHasherNTT;
+use lattice_bench::swifft::simd::SwifftHasherSimd;
 
 // 글로벌 할당자 등록
 #[global_allocator]
 static ALLOC: Alloc = Alloc;
 
+fn bytes_to_naive_polys(chunk: &[u8]) -> [SwifftPolyNaive; 16] {
+    let mut polys = [SwifftPolyNaive::new(); 16];
+    for i in 0..16 {
+        let poly_chunk = &chunk[i * 16..(i + 1) * 16];
+        for j in 0..16 {
+            let byte = poly_chunk[j];
+            for b in 0..4 {
+                polys[i].coeffs[j * 4 + b] = ((byte >> (b * 2)) & 0x03) as u16;
+            }
+        }
+    }
+    polys
+}
+
 fn main() {
-    // 힙 프로파일링 시작 (dhat-heap.json 자동 생성)
     let _profiler = Profiler::new_heap();
 
     println!("Starting Memory Benchmark for Hash Algorithms...\n");
 
-    // 결과를 저장할 해시맵
     let mut results = HashMap::new();
+    let data = vec![0u8; 1024]; 
 
     // ----------------------------------------------------
-    // 1. Keccak-256 측정 (바이트 단위)
+    // 1. Keccak-256 측정
     // ----------------------------------------------------
-    let stats_before = HeapStats::get();
+    let _stats_before = HeapStats::get();
     {
         let keccak = Keccak256Hash {};
-        let data = vec![0u8; 1024]; 
-        let _hash = keccak.hash_iter(data.iter().cloned());
+        black_box(keccak.hash_iter(black_box(&data).iter().cloned()));
     }
-    let stats_after = HeapStats::get();
-    let keccak_mem_kb = (stats_after.total_bytes - stats_before.total_bytes) as f64 / 1024.0;
-    results.insert("Keccak", keccak_mem_kb);
+    let _stats_after = HeapStats::get();
+    results.insert("Keccak", (_stats_after.total_bytes - _stats_before.total_bytes) as f64 / 1024.0);
 
     // ----------------------------------------------------
-    // 2. SHA-256 측정 (바이트 단위)
+    // 2. SHA-256 측정
     // ----------------------------------------------------
-    let stats_before = HeapStats::get();
+    let _stats_before = HeapStats::get();
     {
         let sha256 = Sha256 {}; 
-        let data = vec![0u8; 1024]; 
-        let _hash = sha256.hash_iter(data.iter().cloned());
+        black_box(sha256.hash_iter(black_box(&data).iter().cloned()));
     }
-    let stats_after = HeapStats::get();
-    let sha256_mem_kb = (stats_after.total_bytes - stats_before.total_bytes) as f64 / 1024.0;
-    results.insert("SHA-256", sha256_mem_kb);
+    let _stats_after = HeapStats::get();
+    results.insert("SHA-256", (_stats_after.total_bytes - _stats_before.total_bytes) as f64 / 1024.0);
 
     // ----------------------------------------------------
-    // 3. Poseidon2 측정 (유한체 Field 단위)
+    // 3. Poseidon2 측정
     // ----------------------------------------------------
-    let stats_before = HeapStats::get();
+    let _stats_before = HeapStats::get();
     {
-        // 최신 rand 0.10.1 문법인 rand::rng()를 사용합니다.
-        let mut rng = rand::rng(); 
-        
+        // 🟢 OS에 의존하지 않는 고정 시드 난수기 사용 (결정론적 벤치마크)
+        let mut rng = StdRng::seed_from_u64(0);
         let poseidon_perm = Poseidon2BabyBear::<16>::new_from_rng_128(&mut rng);
         let hasher = PaddingFreeSponge::<_, 16, 8, 4>::new(poseidon_perm);
         
-        let data = vec![BabyBear::default(); 256]; 
-        let _hash = hasher.hash_iter(data.iter().cloned());
+        let data_bear = vec![BabyBear::default(); 256]; 
+        black_box(hasher.hash_iter(black_box(&data_bear).iter().cloned()));
     }
-    let stats_after = HeapStats::get();
+    let _stats_after = HeapStats::get();
+    results.insert("Poseidon", (_stats_after.total_bytes - _stats_before.total_bytes) as f64 / 1024.0);
 
     // ----------------------------------------------------
-    // 4. SWIFFT 측정 (격자 다항식 단위)
+    // 🟢 공통 키 생성 (중괄호 바깥으로 완전히 빼서 에러 해결!)
     // ----------------------------------------------------
-    let stats_before = HeapStats::get();
+    let mut dummy_keys_i32 = [[0i32; 64]; 16];
+    for i in 0..16 {
+        for j in 0..64 { dummy_keys_i32[i][j] = ((i + j) % 257) as i32; }
+    }
+
+    // ----------------------------------------------------
+    // 4. SWIFFT (Naive)
+    // ----------------------------------------------------
+    let _stats_before = HeapStats::get();
     {
-        let swifft = SwifftHasher::new();
-        let inputs = [SwifftPoly::new(); 16];
-        let _res = swifft.compress(&inputs);
+        let swifft_naive = SwifftHasherNaive::new();
+        for chunk in data.chunks_exact(256) {
+            let polys = bytes_to_naive_polys(chunk);
+            black_box(swifft_naive.compress(black_box(&polys)));
+        }
     }
-    let stats_after = HeapStats::get();
-    let swifft_mem_kb = (stats_after.total_bytes - stats_before.total_bytes) as f64 / 1024.0;
-    results.insert("SWIFFT", swifft_mem_kb);
+    let _stats_after = HeapStats::get();
+    results.insert("SWIFFT-Naive", (_stats_after.total_bytes - _stats_before.total_bytes) as f64 / 1024.0);
 
     // ----------------------------------------------------
-    // JSON 파일로 내보내기 (memory_results.json)
+    // 5. SWIFFT (Scalar/NTT)
+    // ----------------------------------------------------
+    let _stats_before = HeapStats::get();
+    {
+        let swifft_scalar = SwifftHasherNTT::new(&dummy_keys_i32);
+        for chunk in data.chunks_exact(256) {
+            black_box(swifft_scalar.hash(black_box(chunk)));
+        }
+    }
+    let _stats_after = HeapStats::get();
+    results.insert("SWIFFT-Scalar", (_stats_after.total_bytes - _stats_before.total_bytes) as f64 / 1024.0);
+
+    // ----------------------------------------------------
+    // 6. SWIFFT (AVX2/SIMD)
+    // ----------------------------------------------------
+    let _stats_before = HeapStats::get();
+    {
+        let swifft_simd = SwifftHasherSimd::new(&dummy_keys_i32);
+        for chunk in data.chunks_exact(256) {
+            black_box(swifft_simd.hash(black_box(chunk)));
+        }
+    }
+    let _stats_after = HeapStats::get();
+    results.insert("SWIFFT-AVX2", (_stats_after.total_bytes - _stats_before.total_bytes) as f64 / 1024.0);
+
+    // ----------------------------------------------------
+    // JSON 저장
     // ----------------------------------------------------
     let json_output = format!(
-        "{{\n  \"SHA-256\": {:.2},\n  \"Keccak\": {:.2},\n  \"Poseidon\": {:.2},\n  \"SWIFFT\": {:.2}\n}}",
-        results["SHA-256"], results["Keccak"], results["Poseidon"], results["SWIFFT"]
+        "{{\n  \"Keccak\": {:.2},\n  \"SHA-256\": {:.2},\n  \"Poseidon\": {:.2},\n  \"SWIFFT-Naive\": {:.2},\n  \"SWIFFT-Scalar\": {:.2},\n  \"SWIFFT-AVX2\": {:.2}\n}}",
+        results.get("Keccak").unwrap_or(&0.0),
+        results.get("SHA-256").unwrap_or(&0.0),
+        results.get("Poseidon").unwrap_or(&0.0),
+        results.get("SWIFFT-Naive").unwrap_or(&0.0),
+        results.get("SWIFFT-Scalar").unwrap_or(&0.0),
+        results.get("SWIFFT-AVX2").unwrap_or(&0.0)
     );
 
     let mut file = File::create("memory_results.json").expect("Failed to create memory_results.json");
     file.write_all(json_output.as_bytes()).expect("Failed to write to memory_results.json");
 
-    println!("Benchmark finished successfully.");
-    println!("Exported memory results to 'memory_results.json':\n{}", json_output);
+    println!("🎉 Benchmark finished successfully.");
+    println!("💾 Exported memory results to 'memory_results.json':\n{}", json_output);
 }

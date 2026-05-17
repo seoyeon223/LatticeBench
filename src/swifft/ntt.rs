@@ -1,5 +1,8 @@
 // src/swifft/ntt.rs
 
+// 상위 모듈(mod.rs)에 정의된 공통 구조체와 상수를 가져옵니다.
+use super::{SwifftPoly, M};
+
 pub const Q: i32 = 257;
 pub const N: usize = 64;
 pub const LOG_N: usize = 6;
@@ -41,11 +44,12 @@ fn reverse_bits(n: usize, bits: u32) -> usize {
     // usize의 전체 비트를 뒤집은 뒤, 우리가 필요한 비트 수만큼만 오른쪽으로 시프트
     n.reverse_bits() >> (usize::BITS - bits)
 }
+
 /// Cooley-Tukey 기반 64-point NTT 및 Inverse NTT 알고리즘
 pub fn ntt(a: &mut [i32; N], inverse: bool) {
     // 1. Bit-reversal Permutation (입력 재배치)
     for i in 0..N {
-        let rev = reverse_bits(i, LOG_N);
+        let rev = reverse_bits(i, LOG_N as u32);
         if i < rev {
             a.swap(i, rev);
         }
@@ -58,17 +62,14 @@ pub fn ntt(a: &mut [i32; N], inverse: bool) {
     let mut len = 2;
     while len <= N {
         let half = len / 2;
-        // 현재 부분 문제의 크기에 맞는 w_len 도출 (w_len = root^(N/len))
         let w_len = mod_exp(root, N / len);
 
         for i in (0..N).step_by(len) {
             let mut w = 1;
             for j in 0..half {
                 let u = a[i + j];
-                // 회전 인자(Twiddle factor)를 곱한 값
                 let v = mod_q(a[i + j + half] * w); 
                 
-                // 나비 연산 (교차 더하기/빼기)
                 a[i + j] = mod_q(u + v);
                 a[i + j + half] = mod_q(u - v);
                 
@@ -91,31 +92,88 @@ pub fn negacyclic_convolution(a: &[i32; N], b: &[i32; N]) -> [i32; N] {
     let mut a_ntt = [0; N];
     let mut b_ntt = [0; N];
 
-    // [Step 1] 전처리(Weighting): a'_i = a_i * \psi^i
     for i in 0..N {
         a_ntt[i] = mod_q(a[i] * mod_exp(PSI, i));
         b_ntt[i] = mod_q(b[i] * mod_exp(PSI, i));
     }
 
-    // [Step 2] Standard NTT 수행
     ntt(&mut a_ntt, false);
     ntt(&mut b_ntt, false);
 
-    // [Step 3] Point-wise Multiplication (인덱스별 스칼라 곱)
     let mut c_ntt = [0; N];
     for i in 0..N {
         c_ntt[i] = mod_q(a_ntt[i] * b_ntt[i]);
     }
 
-    // [Step 4] Inverse NTT 수행 (결과는 다시 시간 영역으로 복원됨)
     ntt(&mut c_ntt, true);
 
-    // [Step 5] 후처리(Unweighting): c_i = c'_i * \psi^{-i}
     let mut result = [0; N];
     for i in 0..N {
         result[i] = mod_q(c_ntt[i] * mod_exp(PSI_INV, i)); 
-        // 64^{-1} 곱셈은 INTT 내부에서 이미 처리되었으므로 PSI_INV만 곱함
     }
 
     result
+}
+
+/// SWIFFT 해시 인스턴스 구조체 (NTT 기반 스칼라 버전)
+#[derive(Clone, Debug)]
+pub struct SwifftHasherNTT {
+    pub a_keys_ntt: [SwifftPoly; M],
+}
+
+impl SwifftHasherNTT {
+    /// 새로운 SWIFFT 해시 인스턴스 생성 및 키 전처리
+    pub fn new(raw_keys: &[[i32; N]; M]) -> Self {
+        let mut a_keys_ntt = [SwifftPoly::zero(); M];
+
+        for i in 0..M {
+            let mut key_ntt = [0; N];
+            
+            for j in 0..N {
+                let psi_power = mod_exp(PSI, j);
+                key_ntt[j] = mod_q(raw_keys[i][j] * psi_power);
+            }
+            
+            ntt(&mut key_ntt, false);
+            a_keys_ntt[i] = SwifftPoly::new(key_ntt);
+        }
+
+        Self { a_keys_ntt }
+    }
+
+    /// NTT를 사용한 스칼라 방식의 해시 함수
+    pub fn hash(&self, input: &[u8]) -> SwifftPoly {
+        assert_eq!(input.len(), 256, "SWIFFT input must be 256 bytes");
+
+        let mut result_ntt = [0i32; N];
+
+        for i in 0..M {
+            let mut x_poly = [0i32; N];
+            let chunk = &input[i * 16..(i + 1) * 16];
+            
+            for j in 0..16 {
+                let byte = chunk[j];
+                for b in 0..4 {
+                    x_poly[j * 4 + b] = ((byte >> (b * 2)) & 0x03) as i32;
+                }
+            }
+
+            ntt(&mut x_poly, false);
+
+            for k in 0..N {
+                let term = mod_q(self.a_keys_ntt[i].coeffs[k] * x_poly[k]);
+                result_ntt[k] = mod_q(result_ntt[k] + term);
+            }
+        }
+
+        ntt(&mut result_ntt, true);
+
+        let mut final_result = [0i32; N];
+        for j in 0..N {
+            let psi_inv_power = mod_exp(PSI_INV, j);
+            final_result[j] = mod_q(result_ntt[j] * psi_inv_power);
+        }
+
+        SwifftPoly::new(final_result)
+    }
 }

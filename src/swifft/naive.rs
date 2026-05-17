@@ -1,4 +1,4 @@
-// lattice-bench/src/lib.rs
+// src/swifft/naive.rs
 
 /// SWIFFT에서 사용하는 모듈러스 (q = 257)
 pub const SWIFFT_MODULUS: u16 = 257;
@@ -6,17 +6,20 @@ pub const SWIFFT_MODULUS: u16 = 257;
 /// 다항식의 최대 차수 (N = 64)
 pub const SWIFFT_DEGREE: usize = 64;
 
-/// SWIFFT 다항식 구조체
+/// SWIFFT에서 사용하는 다항식의 개수 (m = 16)
+pub const SWIFFT_M: usize = 16;
+
+/// SWIFFT 다항식 구조체 (Naive 버전)
 /// 64개의 계수를 가지며, 각 계수는 0 ~ 256 사이의 값(u16)을 가집니다.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct SwifftPoly {
+pub struct SwifftPolyNaive {
     pub coeffs: [u16; SWIFFT_DEGREE],
 }
 
-impl SwifftPoly {
+impl SwifftPolyNaive {
     /// 모든 계수가 0인 빈 다항식을 생성합니다.
     pub fn new() -> Self {
-        SwifftPoly {
+        SwifftPolyNaive {
             coeffs: [0; SWIFFT_DEGREE],
         }
     }
@@ -32,7 +35,6 @@ impl SwifftPoly {
         }
         result
     }
-    // lattice-bench/src/lib.rs 파일 내부의 impl SwifftPoly 블록 안에 추가
 
     /// O(N^2) 시간 복잡도를 가지는 기본 다항식 곱셈
     /// X^64 + 1 모듈러 축소(Negacyclic Convolution)를 포함합니다.
@@ -71,22 +73,17 @@ impl SwifftPoly {
         result
     }
 }
-// lattice-bench/src/lib.rs 추가
 
-/// SWIFFT에서 사용하는 다항식의 개수 (m = 16)
-pub const SWIFFT_M: usize = 16;
-
-/// SWIFFT 해시 인스턴스
+/// SWIFFT 해시 인스턴스 (Naive 버전)
 /// 시스템 파라미터로 16개의 고정된 무작위 다항식(키)을 가집니다.
-pub struct SwifftHasher {
-    pub keys: [SwifftPoly; SWIFFT_M],
+pub struct SwifftHasherNaive {
+    pub keys: [SwifftPolyNaive; SWIFFT_M],
 }
 
-impl SwifftHasher {
+impl SwifftHasherNaive {
     /// 벤치마크를 위해 임의의 키 값을 가진 해시 인스턴스를 생성합니다.
-    /// (실제 시스템에서는 암호학적으로 안전한 난수 발생기를 사용해 생성 및 고정해야 합니다.)
     pub fn new() -> Self {
-        let mut keys = [SwifftPoly::new(); SWIFFT_M];
+        let mut keys = [SwifftPolyNaive::new(); SWIFFT_M];
         for i in 0..SWIFFT_M {
             for j in 0..SWIFFT_DEGREE {
                 // 테스트용 더미 난수 생성 (i * j mod 257)
@@ -97,8 +94,8 @@ impl SwifftHasher {
     }
 
     /// 16개의 입력 다항식을 받아 1개의 다항식으로 해싱(압축)합니다.
-    pub fn compress(&self, inputs: &[SwifftPoly; SWIFFT_M]) -> SwifftPoly {
-        let mut result = SwifftPoly::new();
+    pub fn compress(&self, inputs: &[SwifftPolyNaive; SWIFFT_M]) -> SwifftPolyNaive {
+        let mut result = SwifftPolyNaive::new();
         
         for i in 0..SWIFFT_M {
             // H = H + (a_i * x_i)
@@ -109,6 +106,7 @@ impl SwifftHasher {
         result
     }
 }
+
 // -------------------------------------------------------------
 // 작성한 로직이 수학적으로 올바른지 검증하는 유닛 테스트
 // -------------------------------------------------------------
@@ -118,8 +116,8 @@ mod tests {
 
     #[test]
     fn test_poly_mul_naive() {
-        let mut poly1 = SwifftPoly::new();
-        let mut poly2 = SwifftPoly::new();
+        let mut poly1 = SwifftPolyNaive::new();
+        let mut poly2 = SwifftPolyNaive::new();
 
         // [첫 번째 테스트]
         // poly1 = X
@@ -132,9 +130,9 @@ mod tests {
         assert_eq!(result1.coeffs[0], 256); 
         assert_eq!(result1.coeffs[1], 0);
 
-        // 🚨 수정된 부분: 두 번째 테스트를 위해 다항식을 빈 상태로 초기화합니다.
-        poly1 = SwifftPoly::new();
-        poly2 = SwifftPoly::new();
+        // 두 번째 테스트를 위해 다항식을 빈 상태로 초기화합니다.
+        poly1 = SwifftPolyNaive::new();
+        poly2 = SwifftPolyNaive::new();
 
         // [두 번째 복합 연산 테스트]
         // poly1 = 2 + 3X
