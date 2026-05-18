@@ -1,8 +1,9 @@
 {
-  "Keccak": 0.00,
-  "SHA-256": 0.00,
-  "Poseidon": 1.55,
-  "SWIFFT-Naive": 0.00,
-  "SWIFFT-Scalar": 0.00,
-  "SWIFFT-AVX2": 0.00
+  "_metric": "additional heap bytes allocated by a single hash call (setup excluded, 256-byte input)",
+  "Keccak": 0,
+  "SHA-256": 0,
+  "Poseidon": 0,
+  "SWIFFT-Naive": 0,
+  "SWIFFT-Scalar": 0,
+  "SWIFFT-AVX2": 0
 }

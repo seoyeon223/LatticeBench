@@ -5,7 +5,7 @@ pub mod swifft;
 
 // 모듈의 구조체들을 crate 최상단에서 사용할 수 있도록 재수출(re-export)
 pub use swifft::naive::{SwifftHasherNaive, SwifftPolyNaive};
-pub use swifft::ntt::SwifftHasherNTT;
+pub use swifft::SwifftHasherNTT;
 pub use swifft::simd::SwifftHasherSimd;
 
 
@@ -80,7 +80,7 @@ impl SwifftPoly {
         result
     }
 }
-// lattice-bench/src/lib.rs 추가
+
 
 /// SWIFFT에서 사용하는 다항식의 개수 (m = 16)
 pub const SWIFFT_M: usize = 16;
