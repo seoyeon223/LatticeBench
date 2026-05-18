@@ -119,7 +119,7 @@ fn main() {
                 black_box(sha256.hash_iter(black_box(&data_256).iter().cloned()));
             },
         );
-        results.insert("SHA-256", bytes);
+        results.insert("SHA-256-style bitwise circuit", bytes);   // "SHA-256" → 표준 키
     }
 
     // ──────────────────────────────────────────────────────────────
@@ -147,7 +147,8 @@ fn main() {
                 );
             },
         );
-        results.insert("Poseidon", bytes);
+        results.insert("Poseidon2", bytes);                       // "Poseidon" → "Poseidon2"
+
     }
 
     // ── SWIFFT 공통 키 (셋업, 측정 제외) ──

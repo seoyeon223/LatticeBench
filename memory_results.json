@@ -1,9 +1,14 @@
 {
-  "_metric": "additional heap bytes allocated by a single hash call (setup excluded, 256-byte input)",
-  "Keccak": 0,
-  "SHA-256": 0,
+  "Keccak": 505537,
   "Poseidon": 0,
-  "SWIFFT-Naive": 0,
-  "SWIFFT-Scalar": 0,
-  "SWIFFT-AVX2": 0
+  "Poseidon2": 199339,
+  "SHA-256": 0,
+  "SHA-256-style bitwise circuit": 20291,
+  "SWIFFT-AVX2": 74388,
+  "SWIFFT-Naive": 74388,
+  "SWIFFT-Scalar": 74388,
+  "_metric": "peak heap KB of full trace-gen + STARK-prove; per-circuit minimal config (see _swifft_log_blowup vs others' blowup=1)",
+  "_swifft_cells": 1572864,
+  "_swifft_height": 32768,
+  "_swifft_log_blowup": 2
 }

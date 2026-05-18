@@ -1,25 +1,23 @@
 // src/bin/trace_swifft.rs
 //
-// SWIFFT 전체 trace 생성 + 검증된 통합 AIR 로 prove/verify (AIR-1 완료).
+// SWIFFT 전체 trace 생성 + 검증된 통합 AIR 로 prove/verify (AIR-1 완료)
+// + STARK 증명 생성 peak 힙 메모리 측정 (mem_prove_* 와 동일 기준).
 //
-// 한 행 = 하나의 게이트. 게이트 3종:
-//   G1 UNPACK : byte -> 2bit 계수 4개 (+bool 비트)
-//   G2 MULMOD : r = (u*f) mod 257           (PSI twist / 점별곱 / 스케일)
-//   G3 BFLY   : Stockham 버터플라이 1개      (forward NTT / INTT)
-// 입력 데이터를 실제로 사용 → 모든 중간값이 진짜 witness.
-// 출력 == SwifftHasherNaive(oracle) 를 self-check 로 보장.
+// === 메모리 측정 관련 객관성 주의 (리포트에 반드시 명시) ===
+// 이 측정의 config 는 SWIFFT AIR 가 *실제로 요구하는 최소값* 이다:
+//   - log_blowup = 2  : 통합 AIR 제약 차수 3 → blowup 1 로는 검증 불가.
+//                        (SHA/Keccak/Poseidon2 는 차수가 낮아 blowup 1.)
+//   - height     = 32768 (2^15) : 1KB(4블록) trace 의 자연 크기.
+//                        (SHA/Keccak/Poseidon2 는 2^14 로 통일.)
+// 따라서 SWIFFT peak 메모리를 다른 셋과 절대값으로 직접 비교하면 안 된다.
+// 각 측정은 "그 회로가 실제 배포 시 요구하는 최소 config 에서의 진짜
+// 비용" 이며, 비교는 log_blowup/height 를 명시한 'config 보정 후'
+// 상대 해석으로만 유효하다. (JSON 에 log_blowup/height/cells 동시 기록.)
 //
-// AIR-1 상태(중요): 이 파일은 trace 생성에 더해, 같은 파일에 이식한
-// 검증된 통합 AIR(G1/G2/G3 + selector — 단독·통합 모두 Python+cargo 로
-// completeness/soundness 검증 완료)로 전체 trace 를 실제 prove+verify 한다.
-// 따라서 출력 trace size 는 "AIR 제약이 강제하는 정직한 값" 이며,
-// Keccak/Poseidon 의 실제 AIR trace 와 동일 기준으로 비교 가능하다.
-// 라벨: "SWIFFT (AIR, constraints verified)".  (결론: swifft_benchmark_
-// conclusion.md — 정직 비교 시 Keccak 의 약 2.3배.)
+// 한 행 = 하나의 게이트. G1 UNPACK / G2 MULMOD / G3 BFLY.
+// 출력 == SwifftHasherNaive(oracle) self-check 로 보장.
 
 use p3_baby_bear::BabyBear;
-// 필드원소 생성은 BabyBear::new(u32) (이 리비전에서 air_mulmod.rs 로
-// 컴파일·동작 확인). from_u32/from_canonical_u32 는 이 리비전에 없음.
 use p3_air::{Air, AirBuilder, BaseAir, WindowAccess};
 use p3_field::PrimeCharacteristicRing;
 use p3_matrix::dense::RowMajorMatrix;
@@ -32,23 +30,26 @@ use p3_merkle_tree::MerkleTreeMmcs;
 use p3_symmetric::{CompressionFunctionFromHasher, SerializingHasher};
 use p3_uni_stark::{prove, verify, StarkConfig};
 
+use std::fs;
+use std::hint::black_box;
+
 use lattice_bench::swifft::ntt;
 use lattice_bench::{SwifftHasherNaive, SwifftPolyNaive};
 
+// dhat 힙 프로파일러 (mem_prove_sha256/keccak/poseidon2 와 동일 패턴).
+#[global_allocator]
+static ALLOC: dhat::Alloc = dhat::Alloc;
+
 // ============================================================
-//  검증된 통합 SWIFFT AIR (air_swifft_unified.rs 에서 이식)
-//  - config: prove_bench.rs 패턴 (컴파일·동작 확인)
-//  - 제약: G1/G2/G3 단독 + 통합(5공격 거부) Python+cargo 검증 완료
-//  - 이 trace 의 모든 행이 이 AIR 를 통과함을 Python 30케이스 확인
+//  검증된 통합 SWIFFT AIR (변경 없음)
 // ============================================================
-// AIR 가 쓰는 상수 (trace 측 W/SEL_*/PB 와 동일 값, 이름만 AIR 관례).
 const Q: i32 = 257;
-const WIDTH: usize = 48; // == W (trace 측)
-const SU: usize = 0; // == SEL_UNPACK
-const SM: usize = 1; // == SEL_MULMOD
-const SB: usize = 2; // == SEL_BFLY
-const P: usize = 3; // == PB (payload base)
-// ── 작동 확인된 config (air_mulmod.rs 와 동일) ──
+const WIDTH: usize = 48;
+const SU: usize = 0;
+const SM: usize = 1;
+const SB: usize = 2;
+const P: usize = 3;
+
 type F = BabyBear;
 type ByteHash = Keccak256Hash;
 type FieldHash = SerializingHasher<ByteHash>;
@@ -60,14 +61,17 @@ type ByteChallenger = HashChallenger<u8, ByteHash, 32>;
 type MyChallenger = SerializingChallenger32<F, ByteChallenger>;
 type MyConfig = StarkConfig<MyPcs, F, MyChallenger>;
 
+// SWIFFT AIR 가 실제로 요구하는 검증된 config (변경 금지).
+// log_blowup=2 는 degree-3 제약 때문에 필수 (낮추면 prove/verify 실패).
+const SWIFFT_LOG_BLOWUP: usize = 2;
+
 fn make_config() -> MyConfig {
     let field_hash = FieldHash::new(ByteHash {});
     let compress = MyCompress::new(ByteHash {});
     let mmcs = MyMmcs::new(field_hash, compress, 32);
     let dft = MyDft::default();
     let fri_config = FriParameters {
-        // 통합 degree=3 (곱제약×selector) → log_blowup 2 (단독 게이트는 1이었음)
-        log_blowup: 2,
+        log_blowup: SWIFFT_LOG_BLOWUP,
         log_final_poly_len: 0,
         max_log_arity: 1,
         num_queries: 100,
@@ -92,9 +96,7 @@ impl<FF> BaseAir<FF> for SwifftUnifiedAir {
 impl<AB: AirBuilder> Air<AB> for SwifftUnifiedAir {
     fn eval(&self, builder: &mut AB) {
         let main = builder.main();
-        let col = |i: usize| -> AB::Expr {
-            main.current(i).unwrap().clone().into()
-        };
+        let col = |i: usize| -> AB::Expr { main.current(i).unwrap().clone().into() };
         let u32_expr = |n: u32| -> AB::Expr {
             let mut acc = AB::Expr::ZERO;
             let mut base = AB::Expr::ONE;
@@ -113,14 +115,10 @@ impl<AB: AirBuilder> Air<AB> for SwifftUnifiedAir {
         let sm = col(SM);
         let sb = col(SB);
 
-        // S1: selector bool
         builder.assert_zero(su.clone() * su.clone() - su.clone());
         builder.assert_zero(sm.clone() * sm.clone() - sm.clone());
         builder.assert_zero(sb.clone() * sb.clone() - sb.clone());
-        // S2: 합 = 1  (soundness 핵심 — 게이트 우회/위장/패딩위장 전부 차단)
-        builder.assert_zero(
-            su.clone() + sm.clone() + sb.clone() - AB::Expr::ONE,
-        );
+        builder.assert_zero(su.clone() + sm.clone() + sb.clone() - AB::Expr::ONE);
 
         let q = u32_expr(257);
         let c4 = u32_expr(4);
@@ -129,14 +127,13 @@ impl<AB: AirBuilder> Air<AB> for SwifftUnifiedAir {
         let c256 = u32_expr(256);
         let two = u32_expr(2);
 
-        // ── G1 제약 (sel_u 가드: su * C = 0) ──
+        // ── G1 UNPACK ──
         {
             let byte = col(P);
             let c0 = col(P + 1);
             let c1 = col(P + 2);
             let c2 = col(P + 3);
             let c3 = col(P + 4);
-            // U1: su * (byte - (c0+4c1+16c2+64c3)) = 0
             builder.assert_zero(
                 su.clone()
                     * (byte
@@ -149,23 +146,15 @@ impl<AB: AirBuilder> Air<AB> for SwifftUnifiedAir {
             for k in 0..4 {
                 let hi = col(P + 5 + 2 * k);
                 let lo = col(P + 6 + 2 * k);
-                // U3: su * bool(hi), su * bool(lo)
+                builder.assert_zero(su.clone() * (hi.clone() * hi.clone() - hi.clone()));
+                builder.assert_zero(su.clone() * (lo.clone() * lo.clone() - lo.clone()));
                 builder.assert_zero(
-                    su.clone() * (hi.clone() * hi.clone() - hi.clone()),
-                );
-                builder.assert_zero(
-                    su.clone() * (lo.clone() * lo.clone() - lo.clone()),
-                );
-                // U2: su * (c_k - (2 hi + lo)) = 0
-                builder.assert_zero(
-                    su.clone()
-                        * (cs[k].clone()
-                            - (two.clone() * hi + lo)),
+                    su.clone() * (cs[k].clone() - (two.clone() * hi + lo)),
                 );
             }
         }
 
-        // ── G2 제약 (sel_m 가드: sm * C = 0) ──
+        // ── G2 MULMOD ──
         {
             let u = col(P);
             let f = col(P + 1);
@@ -173,57 +162,35 @@ impl<AB: AirBuilder> Air<AB> for SwifftUnifiedAir {
             let k = col(P + 3);
             let r = col(P + 4);
             let r_top = col(P + 13);
-            // M1: sm*(prod - u*f)
+            builder.assert_zero(sm.clone() * (prod.clone() - u * f));
             builder.assert_zero(
-                sm.clone() * (prod.clone() - u * f),
+                sm.clone() * (prod - (q.clone() * k.clone() + r.clone())),
             );
-            // M2: sm*(prod - 257k - r)
-            builder.assert_zero(
-                sm.clone()
-                    * (prod - (q.clone() * k.clone() + r.clone())),
-            );
-            // r_low = Σ r_bit 2^i, sm*bool
             let mut r_low = AB::Expr::ZERO;
             let mut pw = AB::Expr::ONE;
             for i in 0..8 {
                 let bit = col(P + 5 + i);
-                builder.assert_zero(
-                    sm.clone()
-                        * (bit.clone() * bit.clone() - bit.clone()),
-                );
+                builder.assert_zero(sm.clone() * (bit.clone() * bit.clone() - bit.clone()));
                 r_low = r_low + bit * pw.clone();
                 pw = pw.clone() + pw.clone();
             }
+            builder.assert_zero(sm.clone() * (r_top.clone() * r_top.clone() - r_top.clone()));
             builder.assert_zero(
-                sm.clone()
-                    * (r_top.clone() * r_top.clone() - r_top.clone()),
+                sm.clone() * (r.clone() - (r_low.clone() + c256.clone() * r_top.clone())),
             );
-            // M3a: sm*(r - r_low - 256 r_top)
-            builder.assert_zero(
-                sm.clone()
-                    * (r.clone()
-                        - (r_low.clone()
-                            + c256.clone() * r_top.clone())),
-            );
-            // M3d: sm*(r_top * r_low)  (=> r∈[0,256])
-            builder
-                .assert_zero(sm.clone() * (r_top * r_low));
-            // M4: k = Σ k_bit 2^i, sm*bool ; sm*(k - k_val)
+            builder.assert_zero(sm.clone() * (r_top * r_low));
             let mut k_val = AB::Expr::ZERO;
             let mut pw2 = AB::Expr::ONE;
             for i in 0..8 {
                 let bit = col(P + 14 + i);
-                builder.assert_zero(
-                    sm.clone()
-                        * (bit.clone() * bit.clone() - bit.clone()),
-                );
+                builder.assert_zero(sm.clone() * (bit.clone() * bit.clone() - bit.clone()));
                 k_val = k_val + bit * pw2.clone();
                 pw2 = pw2.clone() + pw2.clone();
             }
             builder.assert_zero(sm.clone() * (k - k_val));
         }
 
-        // ── G3 제약 (sel_b 가드: sb * C = 0) ──
+        // ── G3 BFLY ──
         {
             let a = col(P);
             let b = col(P + 1);
@@ -239,114 +206,61 @@ impl<AB: AirBuilder> Air<AB> for SwifftUnifiedAir {
             let lo_top = col(P + 35);
             let hi_top = col(P + 44);
 
-            // B1: sb*(prod - w*b)
             builder.assert_zero(sb.clone() * (prod.clone() - w * b));
-            // B2: sb*(prod - 257 k1 - v)
             builder.assert_zero(
-                sb.clone()
-                    * (prod - (q.clone() * k1.clone() + v.clone())),
+                sb.clone() * (prod - (q.clone() * k1.clone() + v.clone())),
             );
-            // B3: v range (v_low 8bit bool, v_top bool, v_top*v_low=0)
             let mut v_low = AB::Expr::ZERO;
             let mut pw = AB::Expr::ONE;
             for i in 0..8 {
                 let bit = col(P + 10 + i);
-                builder.assert_zero(
-                    sb.clone()
-                        * (bit.clone() * bit.clone() - bit.clone()),
-                );
+                builder.assert_zero(sb.clone() * (bit.clone() * bit.clone() - bit.clone()));
                 v_low = v_low + bit * pw.clone();
                 pw = pw.clone() + pw.clone();
             }
+            builder.assert_zero(sb.clone() * (v_top.clone() * v_top.clone() - v_top.clone()));
             builder.assert_zero(
-                sb.clone()
-                    * (v_top.clone() * v_top.clone() - v_top.clone()),
+                sb.clone() * (v.clone() - (v_low.clone() + c256.clone() * v_top.clone())),
             );
-            builder.assert_zero(
-                sb.clone()
-                    * (v.clone()
-                        - (v_low.clone()
-                            + c256.clone() * v_top.clone())),
-            );
-            builder
-                .assert_zero(sb.clone() * (v_top * v_low));
-            // Bk: k1 range
+            builder.assert_zero(sb.clone() * (v_top * v_low));
             let mut k1v = AB::Expr::ZERO;
             let mut pw2 = AB::Expr::ONE;
             for i in 0..8 {
                 let bit = col(P + 19 + i);
-                builder.assert_zero(
-                    sb.clone()
-                        * (bit.clone() * bit.clone() - bit.clone()),
-                );
+                builder.assert_zero(sb.clone() * (bit.clone() * bit.clone() - bit.clone()));
                 k1v = k1v + bit * pw2.clone();
                 pw2 = pw2.clone() + pw2.clone();
             }
             builder.assert_zero(sb.clone() * (k1 - k1v));
-            // B6: flo,fhi bool
+            builder.assert_zero(sb.clone() * (flo.clone() * flo.clone() - flo.clone()));
+            builder.assert_zero(sb.clone() * (fhi.clone() * fhi.clone() - fhi.clone()));
             builder.assert_zero(
-                sb.clone() * (flo.clone() * flo.clone() - flo.clone()),
+                sb.clone() * (lo.clone() - (a.clone() + v.clone() - q.clone() * flo)),
             );
-            builder.assert_zero(
-                sb.clone() * (fhi.clone() * fhi.clone() - fhi.clone()),
-            );
-            // B4: sb*(lo - (a + v - 257 flo))
-            builder.assert_zero(
-                sb.clone()
-                    * (lo.clone()
-                        - (a.clone() + v.clone()
-                            - q.clone() * flo)),
-            );
-            // B5: sb*(hi - (a - v + 257 fhi))
-            builder.assert_zero(
-                sb.clone() * (hi.clone() - (a - v + q * fhi)),
-            );
-            // B7lo: lo range
+            builder.assert_zero(sb.clone() * (hi.clone() - (a - v + q * fhi)));
             let mut lo_low = AB::Expr::ZERO;
             let mut pw3 = AB::Expr::ONE;
             for i in 0..8 {
                 let bit = col(P + 27 + i);
-                builder.assert_zero(
-                    sb.clone()
-                        * (bit.clone() * bit.clone() - bit.clone()),
-                );
+                builder.assert_zero(sb.clone() * (bit.clone() * bit.clone() - bit.clone()));
                 lo_low = lo_low + bit * pw3.clone();
                 pw3 = pw3.clone() + pw3.clone();
             }
+            builder.assert_zero(sb.clone() * (lo_top.clone() * lo_top.clone() - lo_top.clone()));
             builder.assert_zero(
-                sb.clone()
-                    * (lo_top.clone() * lo_top.clone()
-                        - lo_top.clone()),
+                sb.clone() * (lo - (lo_low.clone() + c256.clone() * lo_top.clone())),
             );
-            builder.assert_zero(
-                sb.clone()
-                    * (lo
-                        - (lo_low.clone()
-                            + c256.clone() * lo_top.clone())),
-            );
-            builder
-                .assert_zero(sb.clone() * (lo_top * lo_low));
-            // B7hi: hi range
+            builder.assert_zero(sb.clone() * (lo_top * lo_low));
             let mut hi_low = AB::Expr::ZERO;
             let mut pw4 = AB::Expr::ONE;
             for i in 0..8 {
                 let bit = col(P + 36 + i);
-                builder.assert_zero(
-                    sb.clone()
-                        * (bit.clone() * bit.clone() - bit.clone()),
-                );
+                builder.assert_zero(sb.clone() * (bit.clone() * bit.clone() - bit.clone()));
                 hi_low = hi_low + bit * pw4.clone();
                 pw4 = pw4.clone() + pw4.clone();
             }
-            builder.assert_zero(
-                sb.clone()
-                    * (hi_top.clone() * hi_top.clone()
-                        - hi_top.clone()),
-            );
-            builder.assert_zero(
-                sb.clone()
-                    * (hi - (hi_low.clone() + c256 * hi_top.clone())),
-            );
+            builder.assert_zero(sb.clone() * (hi_top.clone() * hi_top.clone() - hi_top.clone()));
+            builder.assert_zero(sb.clone() * (hi - (hi_low.clone() + c256 * hi_top.clone())));
             builder.assert_zero(sb.clone() * (hi_top * hi_low));
         }
     }
@@ -355,37 +269,24 @@ impl<AB: AirBuilder> Air<AB> for SwifftUnifiedAir {
 const M: usize = 16;
 const N: usize = 64;
 const LOG_N: usize = 6;
-
-// trace 컬럼 레이아웃 — 검증된 통합 AIR(air_swifft_unified.rs)와 정확히 일치.
-// 0 sel_u | 1 sel_m | 2 sel_b | 3.. payload(게이트별, 최대 45)
-//   G1: P byte | P+1..P+4 c0..c3 | P+5..P+12 (hi0,lo0,..,hi3,lo3)
-//   G2: P u|P+1 f|P+2 prod|P+3 k|P+4 r|P+5..P+12 r_low8|P+13 r_top|P+14..P+21 k8
-//   G3: P a|P+1 b|P+2 w|P+3 prod|P+4 k1|P+5 v|P+6 lo|P+7 hi|P+8 flo|P+9 fhi|
-//       P+10..P+17 v_low8|P+18 v_top|P+19..P+26 k1_8|P+30..P+37? -> 아래 상수
-// (range-check 비트는 soundness 필수 — 단독/통합 AIR 에서 검증됨.)
 const W: usize = 48;
 const SEL_UNPACK: usize = 0;
 const SEL_MULMOD: usize = 1;
 const SEL_BFLY: usize = 2;
-const PB: usize = 3; // payload base
+const PB: usize = 3;
 
 #[inline]
 fn f(x: u32) -> BabyBear {
-    // 이 plonky3 리비전(64b3cc0): from_u32/from_canonical_u32 없음.
-    // air_mulmod.rs 에서 컴파일·동작 확인된 MontyField31::new 사용.
     BabyBear::new(x)
 }
 
-/// 한 행을 trace 에 push (W개 i32 값을 BabyBear 로).
 fn push_row(values: &mut Vec<BabyBear>, row: &[i32; W]) {
     for &v in row.iter() {
-        // SWIFFT 도메인 값은 항상 음이 아님(게이트 내부에서 보장).
         debug_assert!(v >= 0, "trace value must be non-negative, got {v}");
         values.push(f(v as u32));
     }
 }
 
-/// G1 UNPACK: byte -> c0..c3. 통합 AIR mk_g1 과 동일 레이아웃.
 fn g1_unpack(values: &mut Vec<BabyBear>, byte: u8) -> [i32; 4] {
     let b = byte as i32;
     let cs = [b & 3, (b >> 2) & 3, (b >> 4) & 3, (b >> 6) & 3];
@@ -394,15 +295,13 @@ fn g1_unpack(values: &mut Vec<BabyBear>, byte: u8) -> [i32; 4] {
     row[PB] = b;
     for k in 0..4 {
         row[PB + 1 + k] = cs[k];
-        row[PB + 5 + 2 * k] = (cs[k] >> 1) & 1; // hi_k
-        row[PB + 6 + 2 * k] = cs[k] & 1; // lo_k
+        row[PB + 5 + 2 * k] = (cs[k] >> 1) & 1;
+        row[PB + 6 + 2 * k] = cs[k] & 1;
     }
     push_row(values, &row);
     cs
 }
 
-/// G2 MULMOD: r = (u*f) mod 257. 통합 AIR mk_g2 와 동일 레이아웃
-/// (r_low 8비트 + r_top + k 8비트 = soundness 필수 range-check witness).
 fn g2_mulmod(values: &mut Vec<BabyBear>, u: i32, fac: i32) -> i32 {
     let prod = u * fac;
     let k = prod / ntt::Q;
@@ -418,16 +317,14 @@ fn g2_mulmod(values: &mut Vec<BabyBear>, u: i32, fac: i32) -> i32 {
     let rt = if r == 256 { 1 } else { 0 };
     let rl = if rt == 1 { 0 } else { r };
     for i in 0..8 {
-        row[PB + 5 + i] = (rl >> i) & 1; // r_low 8비트
-        row[PB + 14 + i] = (k >> i) & 1; // k 8비트
+        row[PB + 5 + i] = (rl >> i) & 1;
+        row[PB + 14 + i] = (k >> i) & 1;
     }
-    row[PB + 13] = rt; // r_top
+    row[PB + 13] = rt;
     push_row(values, &row);
     r
 }
 
-/// G3 BFLY: v=(w*b)%Q; lo=(a+v)%Q; hi=(a-v)%Q. 통합 AIR mk_g3 와 동일 레이아웃
-/// (v/k1/lo/hi range-check 비트 = soundness 필수 witness).
 fn g3_bfly(values: &mut Vec<BabyBear>, a: i32, b: i32, w: i32) -> (i32, i32) {
     let prod = w * b;
     let k1 = prod / ntt::Q;
@@ -441,7 +338,6 @@ fn g3_bfly(values: &mut Vec<BabyBear>, a: i32, b: i32, w: i32) -> (i32, i32) {
     debug_assert!(lo == (a + v).rem_euclid(ntt::Q));
     debug_assert!(hi == (a - v).rem_euclid(ntt::Q));
 
-    // x ∈ [0,256] → (low 8bit, top)  (통합 AIR dec() 와 동일)
     let dec = |x: i32| -> ([i32; 8], i32) {
         let t = if x == 256 { 1 } else { 0 };
         let lw = if t == 1 { 0 } else { x };
@@ -486,7 +382,6 @@ fn g3_bfly(values: &mut Vec<BabyBear>, a: i32, b: i32, w: i32) -> (i32, i32) {
     (lo, hi)
 }
 
-/// Stockham 한 스테이지를 BFLY 게이트로 채우며 수행 (ntt.rs 와 동일 인덱싱).
 fn ntt_stage_traced(
     values: &mut Vec<BabyBear>,
     src: &[i32; N],
@@ -508,12 +403,7 @@ fn ntt_stage_traced(
     dst
 }
 
-/// 6 스테이지 NTT (정/역 통일). inverse 면 끝에 N^{-1} 스케일(MULMOD 게이트).
-fn ntt_traced(
-    values: &mut Vec<BabyBear>,
-    a: &[i32; N],
-    inverse: bool,
-) -> [i32; N] {
+fn ntt_traced(values: &mut Vec<BabyBear>, a: &[i32; N], inverse: bool) -> [i32; N] {
     let tw: &[i32; N] = if inverse {
         &ntt::OMEGA_INV_TABLE
     } else {
@@ -533,56 +423,43 @@ fn ntt_traced(
     s
 }
 
-/// 256바이트 블록 하나의 SWIFFT 를 trace 로 채우고 출력 계수를 반환.
-/// keys: 원시 키 [[i32;64];16]. 키 NTT 는 공개 상수라 witness 미기록.
 fn swifft_block_traced(
     values: &mut Vec<BabyBear>,
     data: &[u8],
     keys: &[[i32; N]; M],
 ) -> [i32; N] {
-    // 키 전처리: 키는 공개 상수(전처리)이므로 witness 에 기록하지 않는다.
-    // 검증된 라이브러리 ntt::ntt 를 그대로 사용 (게이트 행 미생성).
-    // → 블록당 16*192=3072 BFLY 행 절감, trace 약 50% 감소.
-    //   (Python 300케이스: 키 trace제외해도 출력==oracle 동일 확인.)
     let mut keys_ntt = [[0i32; N]; M];
     for i in 0..M {
         let mut kt = [0i32; N];
         for j in 0..N {
             kt[j] = (keys[i][j] * ntt::PSI_TABLE[j]).rem_euclid(ntt::Q);
         }
-        ntt::ntt(&mut kt, false); // 공개 상수 계산 — witness 아님
+        ntt::ntt(&mut kt, false);
         keys_ntt[i] = kt;
     }
 
     let mut acc = [0i32; N];
     for i in 0..M {
         let chunk = &data[i * 16..(i + 1) * 16];
-        // [1] 언패킹
         let mut x = [0i32; N];
         for (jb, &byte) in chunk.iter().enumerate() {
             let cs = g1_unpack(values, byte);
             x[jb * 4..jb * 4 + 4].copy_from_slice(&cs);
         }
-        // [2] PSI twist
         let mut xt = [0i32; N];
         for j in 0..N {
             xt[j] = g2_mulmod(values, x[j], ntt::PSI_TABLE[j]);
         }
-        // [3] forward NTT
         let xf = ntt_traced(values, &xt, false);
-        // [4] 점별 곱 + 누적 (곱은 MULMOD 게이트, 누적은 선형)
         for j in 0..N {
             let p = g2_mulmod(values, xf[j], keys_ntt[i][j]);
             acc[j] += p;
         }
     }
-    // 누적 환원
     for j in 0..N {
         acc[j] = acc[j].rem_euclid(ntt::Q);
     }
-    // [5] INTT
     let c = ntt_traced(values, &acc, true);
-    // [6] PSI^{-1} untwist
     let mut out = [0i32; N];
     for j in 0..N {
         out[j] = g2_mulmod(values, c[j], ntt::PSI_INV_TABLE[j]);
@@ -590,41 +467,24 @@ fn swifft_block_traced(
     out
 }
 
-/// data 전체(256바이트 배수)를 한 trace 에 쌓고 next_power_of_two 로 패딩.
-fn generate_swifft_trace(
-    data: &[u8],
-    keys: &[[i32; N]; M],
-) -> RowMajorMatrix<BabyBear> {
+fn generate_swifft_trace(data: &[u8], keys: &[[i32; N]; M]) -> RowMajorMatrix<BabyBear> {
     assert!(
         data.len() % 256 == 0 && !data.is_empty(),
         "input must be a non-empty multiple of 256 bytes"
     );
     let num_blocks = data.len() / 256;
-
-    // 사전 용량 확보 (행마다 vec![] 임시할당 제거).
-    // 키 NTT 제외 후 블록당 약 5696행 (BFLY 3264 + MULMOD 2176 + UNPACK 256).
     let mut values: Vec<BabyBear> = Vec::with_capacity(num_blocks * 5700 * W);
 
     for blk in 0..num_blocks {
-        let _ = swifft_block_traced(
-            &mut values,
-            &data[blk * 256..(blk + 1) * 256],
-            keys,
-        );
+        let _ = swifft_block_traced(&mut values, &data[blk * 256..(blk + 1) * 256], keys);
     }
 
-    // 전체 height 를 2의 거듭제곱으로 패딩 (STARK 요구).
-    // 패딩 = 유효한 G1 NOP 행 (byte=0 → sel_u=1, 나머지 payload 0).
-    // 전부-0 패딩은 통합 AIR S2(sel 합=1) 를 위반하므로 금지
-    // (air_swifft_unified.rs 공격E 에서 검증됨). g1_unpack(0) 와 동일 행.
     let rows_filled = values.len() / W;
     debug_assert_eq!(values.len() % W, 0, "row alignment broken");
     let padded = rows_filled.next_power_of_two();
     assert!(rows_filled <= padded);
-    // G1 NOP 행 한 개를 미리 구성 (byte=0).
     let mut nop = [0i32; W];
     nop[SEL_UNPACK] = 1;
-    // byte=0 → c0..c3=0, 모든 hi/lo=0 (이미 0). payload 전부 0.
     for _ in rows_filled..padded {
         for &v in nop.iter() {
             values.push(f(v as u32));
@@ -635,9 +495,11 @@ fn generate_swifft_trace(
 }
 
 fn main() {
+    // dhat 힙 프로파일러 시작 (이 시점부터 모든 힙 할당 추적).
+    let _profiler = dhat::Profiler::new_heap();
+
     println!("SWIFFT full trace + verified unified AIR prove/verify (AIR-1)\n");
 
-    // 1KB = 4 블록. 결정적 더미 키.
     let data = vec![0u8; 1024];
     let mut keys = [[0i32; N]; M];
     for i in 0..M {
@@ -646,9 +508,8 @@ fn main() {
         }
     }
 
-    // ── self-check: trace 출력이 검증된 naive oracle 과 일치하는지 ──
+    // ── self-check ──
     {
-        // 임의 입력으로 1블록 검증 (oracle = SwifftHasherNaive).
         let mut probe = [0u8; 256];
         for (idx, b) in probe.iter_mut().enumerate() {
             *b = ((idx * 7 + 13) & 0xFF) as u8;
@@ -656,7 +517,6 @@ fn main() {
         let mut scratch: Vec<BabyBear> = Vec::new();
         let got = swifft_block_traced(&mut scratch, &probe, &keys);
 
-        // oracle
         let naive = SwifftHasherNaive {
             keys: core::array::from_fn(|i| {
                 let mut p = SwifftPolyNaive::new();
@@ -677,8 +537,7 @@ fn main() {
             }
         }
         let expect = naive.compress(&polys).coeffs;
-        let got_u16: [u16; N] =
-            core::array::from_fn(|j| got[j].rem_euclid(ntt::Q) as u16);
+        let got_u16: [u16; N] = core::array::from_fn(|j| got[j].rem_euclid(ntt::Q) as u16);
         assert_eq!(
             got_u16, expect,
             "trace witness output != naive oracle (trace generation is WRONG)"
@@ -694,40 +553,116 @@ fn main() {
     println!("Trace generated for 1KB ({} blocks).", data.len() / 256);
     println!("Dimensions: {height} rows x {width} cols");
     println!("Trace Size (cells): {total_cells}");
-    println!(
-        "(Key NTT excluded from witness — keys are public constants.)"
-    );
+    println!("(Key NTT excluded from witness — keys are public constants.)");
 
-    // ── 통합 AIR 로 실제 prove → verify (AIR-1 완성) ──
-    // 이 trace 의 모든 행이 검증된 통합 AIR(G1/G2/G3 + selector)를 만족함을
-    // Python 30케이스로 확인했고, 단독·통합 AIR 의 soundness 도 cargo 로
-    // 실측 완료. 여기서 전체 SWIFFT trace 에 대해 prove/verify 가 성공하면
-    // "더미"가 아닌 "AIR 가 강제하는 진짜 SWIFFT trace" 임이 증명된다.
+    // ── prove → (peak 메모리 측정) → verify ──
     {
         let config = make_config();
         let air = SwifftUnifiedAir;
         println!("\nProving full SWIFFT trace under the unified AIR...");
+
+        let before = dhat::HeapStats::get();
         let proof = prove::<MyConfig, _>(&config, &air, trace, &[]);
-        match verify(&config, &air, &proof, &[]) {
-            Ok(()) => {
-                println!(
-                    "[AIR-1] full SWIFFT prove + verify -> OK\n\
-                     This trace is now enforced by verified AIR constraints\n\
-                     (not a dummy). Honest trace size: {total_cells} cells\n\
-                     ({height} rows x {width} cols), degree 3, log_blowup 2."
-                );
-            }
-            Err(e) => {
-                println!("[AIR-1] full SWIFFT verify FAILED: {e:?}");
-                std::process::exit(1);
-            }
+        // prove 직후 / verify 직전에 측정 → verify 메모리를 peak 해석에서 분리.
+        // (max_bytes 는 누적 peak 이나 SWIFFT 는 prove ≫ verify 라 실용상 무방.)
+        let after_prove = dhat::HeapStats::get();
+        black_box(&proof);
+
+        let verify_ok = verify(&config, &air, &proof, &[]).is_ok();
+
+        let peak_bytes = after_prove.max_bytes;
+        let peak_kb = peak_bytes as f64 / 1024.0;
+        let prove_alloc_delta =
+            after_prove.total_bytes.saturating_sub(before.total_bytes);
+
+        if verify_ok {
+            println!(
+                "[AIR-1] full SWIFFT prove + verify -> OK\n\
+                 This trace is now enforced by verified AIR constraints\n\
+                 (not a dummy). Honest trace size: {total_cells} cells\n\
+                 ({height} rows x {width} cols), degree 3, log_blowup {SWIFFT_LOG_BLOWUP}."
+            );
+        } else {
+            println!("[AIR-1] full SWIFFT verify FAILED");
+            std::process::exit(1);
         }
+
+        println!(
+            "Peak heap (trace+prove workflow): {peak_bytes} bytes ({peak_kb:.1} KB)"
+        );
+        println!("Prove-section cumulative alloc:   {prove_alloc_delta} bytes");
+
+        // ── memory_results.json 부분 갱신 (SWIFFT 키 + config 메타) ──
+        // SWIFFT 3 변종은 ZK 회로가 동일하므로 같은 peak 값을 공유한다
+        // (네이티브 속도만 변종별로 다름; 회로/메모리는 동일 AIR).
+        let path = "memory_results.json";
+        let mut map = match fs::read_to_string(path) {
+            Ok(s) => parse_simple_json(&s),
+            Err(_) => std::collections::BTreeMap::new(),
+        };
+        let kb = peak_kb.round() as i64;
+        for key in ["SWIFFT-Naive", "SWIFFT-Scalar", "SWIFFT-AVX2"] {
+            map.insert(key.to_string(), JVal::Num(kb));
+        }
+        // config 보정용 메타데이터 — 절대 비교 방지, 리포트 근거.
+        map.insert("_swifft_log_blowup".to_string(), JVal::Num(SWIFFT_LOG_BLOWUP as i64));
+        map.insert("_swifft_height".to_string(), JVal::Num(height as i64));
+        map.insert("_swifft_cells".to_string(), JVal::Num(total_cells as i64));
+        map.insert(
+            "_metric".to_string(),
+            JVal::Str(
+                "peak heap KB of full trace-gen + STARK-prove; per-circuit minimal config (see _swifft_log_blowup vs others' blowup=1)".to_string(),
+            ),
+        );
+        fs::write(path, dump_simple_json(&map)).expect("write memory_results.json");
+        println!(
+            "\n💾 Updated {path} [SWIFFT-* = {kb} KB, log_blowup={SWIFFT_LOG_BLOWUP}, height={height}]"
+        );
     }
 
     println!(
-        "\nLabeling: 'SWIFFT (AIR, constraints verified)'. Comparable on the\n\
-         same basis as Keccak/Poseidon real AIR traces. Next (AIR-2): replace\n\
-         bit-decomposition range checks with LogUp lookups, then pack BFLY/\n\
-         MULMOD to shrink cells (design doc §6 AIR-2)."
+        "\nNote: SWIFFT 메모리는 log_blowup=2 (degree-3 제약 필수) + height\n\
+         {height}(2^15) 기준. SHA/Keccak/Poseidon2 는 blowup=1 + 2^14.\n\
+         절대 비교 금지 — config 보정 후 상대 해석만 유효."
     );
+}
+
+// ── serde 없는 최소 JSON (mem_prove_* 와 동일 구현, 부분 갱신 호환) ──
+#[derive(Clone)]
+enum JVal {
+    Num(i64),
+    Str(String),
+}
+
+fn parse_simple_json(s: &str) -> std::collections::BTreeMap<String, JVal> {
+    let mut m = std::collections::BTreeMap::new();
+    let body = s.trim().trim_start_matches('{').trim_end_matches('}');
+    for part in body.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        if let Some(colon) = part.find(':') {
+            let raw_k = part[..colon].trim().trim_matches('"').to_string();
+            let raw_v = part[colon + 1..].trim();
+            if raw_v.starts_with('"') {
+                m.insert(raw_k, JVal::Str(raw_v.trim_matches('"').to_string()));
+            } else if let Ok(n) = raw_v.parse::<i64>() {
+                m.insert(raw_k, JVal::Num(n));
+            }
+        }
+    }
+    m
+}
+
+fn dump_simple_json(m: &std::collections::BTreeMap<String, JVal>) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for (k, v) in m {
+        let vs = match v {
+            JVal::Num(n) => n.to_string(),
+            JVal::Str(s) => format!("\"{}\"", s.replace('"', "\\\"")),
+        };
+        parts.push(format!("  \"{}\": {}", k, vs));
+    }
+    format!("{{\n{}\n}}", parts.join(",\n"))
 }

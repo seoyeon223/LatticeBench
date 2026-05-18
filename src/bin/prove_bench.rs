@@ -1,19 +1,15 @@
-//src/bin/prove_bench.rs
-
-
 use p3_baby_bear::BabyBear;
+use p3_challenger::{HashChallenger, SerializingChallenger32};
 use p3_dft::Radix2Bowers;
 use p3_fri::{FriParameters, TwoAdicFriPcs};
 use p3_keccak::Keccak256Hash;
+use p3_matrix::Matrix;
 use p3_merkle_tree::MerkleTreeMmcs;
 use p3_symmetric::{CompressionFunctionFromHasher, SerializingHasher};
-use p3_challenger::{HashChallenger, SerializingChallenger32};
 use p3_uni_stark::{StarkConfig, prove};
-use p3_matrix::Matrix; // 🟢 [추가됨] 행렬의 width()와 height()를 구하기 위해 필수!
-use std::time::Instant;
 use std::fs;
+use std::time::Instant;
 
-// 분리했던 SHA-256 모듈 가져오기
 use lattice_bench::sha256::{Sha256BitwiseAir, generate_sha256_trace};
 
 type F = BabyBear;
@@ -33,60 +29,56 @@ fn main() {
     println!("⚙️ Setting up STARK Configuration...\n");
 
     let byte_hash = ByteHash {};
-    let field_hash = FieldHash::new(ByteHash {});
-    let compress = MyCompress::new(ByteHash {});
-    let mmcs = MyMmcs::new(field_hash, compress, 32);
+    let field_hash = FieldHash::new(byte_hash);
+    let compress = MyCompress::new(byte_hash);
+    let mmcs = MyMmcs::new(field_hash, compress, 0); // ← cap_height = 0 추가
 
     let dft = MyDft::default();
 
-    let fri_config = FriParameters {
+    let fri_params = FriParameters {
         log_blowup: 1,
         log_final_poly_len: 0,
-        max_log_arity: 1,
+        max_log_arity: 1,                 // 원본 코드에 있던 필드
         num_queries: 100,
-        commit_proof_of_work_bits: 0,
-        query_proof_of_work_bits: 0,
-        mmcs: mmcs.clone(), 
+        commit_proof_of_work_bits: 0,     // 분리된 PoW 필드 1
+        query_proof_of_work_bits: 0,      // 분리된 PoW 필드 2
+        mmcs: mmcs.clone(),
     };
+    
 
-    let pcs = MyPcs::new(dft, mmcs, fri_config);
+    let pcs = MyPcs::new(dft, mmcs, fri_params);
 
-    // 4. Challenger 인스턴스 생성
     let byte_challenger = ByteChallenger::new(vec![], ByteHash {});
     let challenger = MyChallenger::new(byte_challenger);
 
-    // 5. StarkConfig 조립
     let config = MyConfig::new(pcs, challenger);
 
-    println!("✅ STARK Config successfully initialized!");
-    println!("Generating SHA-256 Trace (16,384 rows)...");
+    println!("✅ STARK Config initialized!");
 
-    let air = Sha256BitwiseAir {};
-    let trace = generate_sha256_trace::<F>();
+    // 2^14 = 16,384 행
+    let num_rows = 1 << 14;
+    println!("Generating trace ({num_rows} rows)...");
 
-    // 🟢 [추가됨] 증명을 생성하기 전에(trace가 소비되기 전에) 크기를 미리 계산하고 출력!
+    let air = Sha256BitwiseAir;
+    let trace = generate_sha256_trace::<F>(num_rows);
+
     let width = trace.width();
     let height = trace.height();
     let trace_size = width * height;
-    
-    println!("📊 Dimensions: {} rows × {} columns", height, width);
-    println!("Trace Size: {}", trace_size); // 대시보드의 정규식이 이 줄을 파싱합니다.
+
+    println!("📊 Dimensions: {height} rows × {width} columns");
+    println!("Trace Size: {trace_size}");
 
     println!("🚀 Starting STARK Proof Generation...");
     let start = Instant::now();
 
-    // 6. 증명 생성!
-    let _proof = prove::<MyConfig, _>(&config, &air, trace, &[]); // _proof로 경고(Warning) 억제
+    let _proof = prove(&config, &air, trace, &vec![]);
 
     let proving_time = start.elapsed().as_micros() as f64;
-    println!("🎉 Proof generated successfully!");
-    println!("⏱️ Proving Time: {:.2} µs", proving_time);
+    println!("🎉 Proof generated!");
+    println!("⏱️ Proving Time: {proving_time:.2} µs");
 
-    // 증명 소요 시간을 JSON으로 저장 (선택 사항)
-    let json_output = format!(r#"{{
-  "SHA-256_Proving_us": {:.2}
-}}"#, proving_time);
-
+    let json_output = format!("{{\n  \"SHA-256_Proving_us\": {proving_time:.2}\n}}");
     fs::write("prove_results.json", json_output).expect("Unable to write JSON");
-    println!("💾 Benchmark results saved to prove_results.json");
+    println!("💾 Saved to prove_results.json");
 }

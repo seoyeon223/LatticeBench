@@ -4,47 +4,50 @@ version = "0.1.0"
 edition = "2021"
 description = "Benchmarking lattice-based and standard cryptographic primitives in a Plonky3-style environment"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/네아이디/lattice-bench-for-plonky3"
-homepage = "https://github.com/네아이디/lattice-bench-for-plonky3"
+repository = "https://github.com/seoyeon223/lattice-bench-for-plonky3"
+homepage = "https://github.com/seoyeon223/lattice-bench-for-plonky3"
 keywords = ["zk", "benchmark", "plonky3", "lattice", "hash"]
 categories = ["cryptography"]
 
 [dependencies]
-p3-field = { git = "https://github.com/Plonky3/Plonky3" }
-p3-symmetric = { git = "https://github.com/Plonky3/Plonky3" }
-p3-poseidon2 = { git = "https://github.com/Plonky3/Plonky3.git" }
-p3-keccak = { git = "https://github.com/Plonky3/Plonky3" }
-p3-keccak-air = { git = "https://github.com/Plonky3/Plonky3" }
-p3-baby-bear = { git = "https://github.com/Plonky3/Plonky3" }
-p3-matrix = { git = "https://github.com/Plonky3/Plonky3.git" }
-p3-air = { git = "https://github.com/Plonky3/Plonky3.git" }
-p3-sha256 = { git = "https://github.com/Plonky3/Plonky3.git" } # Plonky3의 SHA-256
-p3-poseidon2-air = { git = "https://github.com/Plonky3/Plonky3" }
-p3-goldilocks = { git = "https://github.com/Plonky3/Plonky3" }
-
-sha2 = "0.10" # 네이티브 SHA-256 해시 비교용
-dhat = "0.3"
-rand = "0.10.1"
+# ── Plonky3: 모든 crate를 동일 URL + 동일 rev 로 고정 ──────────────
+# URL은 전부 ".git" 형태로 통일, version 키 제거 (git 소스에서 version은 혼란만 유발)
+p3-field         = { git = "https://github.com/Plonky3/Plonky3.git", rev = "64b3cc02b0fd547cb1a40ed52ead029548637ec4" }
+p3-symmetric     = { git = "https://github.com/Plonky3/Plonky3.git", rev = "64b3cc02b0fd547cb1a40ed52ead029548637ec4" }
+p3-poseidon2     = { git = "https://github.com/Plonky3/Plonky3.git", rev = "64b3cc02b0fd547cb1a40ed52ead029548637ec4" }
+p3-keccak        = { git = "https://github.com/Plonky3/Plonky3.git", rev = "64b3cc02b0fd547cb1a40ed52ead029548637ec4" }
+p3-keccak-air    = { git = "https://github.com/Plonky3/Plonky3.git", rev = "64b3cc02b0fd547cb1a40ed52ead029548637ec4" }
+p3-baby-bear     = { git = "https://github.com/Plonky3/Plonky3.git", rev = "64b3cc02b0fd547cb1a40ed52ead029548637ec4" }
+p3-matrix        = { git = "https://github.com/Plonky3/Plonky3.git", rev = "64b3cc02b0fd547cb1a40ed52ead029548637ec4" }
+p3-air           = { git = "https://github.com/Plonky3/Plonky3.git", rev = "64b3cc02b0fd547cb1a40ed52ead029548637ec4" }
+p3-poseidon2-air = { git = "https://github.com/Plonky3/Plonky3.git", rev = "64b3cc02b0fd547cb1a40ed52ead029548637ec4" }
+p3-goldilocks    = { git = "https://github.com/Plonky3/Plonky3.git", rev = "64b3cc02b0fd547cb1a40ed52ead029548637ec4" }
+p3-merkle-tree   = { git = "https://github.com/Plonky3/Plonky3.git", rev = "64b3cc02b0fd547cb1a40ed52ead029548637ec4" }
+p3-dft           = { git = "https://github.com/Plonky3/Plonky3.git", rev = "64b3cc02b0fd547cb1a40ed52ead029548637ec4" }
+p3-fri           = { git = "https://github.com/Plonky3/Plonky3.git", rev = "64b3cc02b0fd547cb1a40ed52ead029548637ec4" }
+p3-challenger    = { git = "https://github.com/Plonky3/Plonky3.git", rev = "64b3cc02b0fd547cb1a40ed52ead029548637ec4" }
+p3-uni-stark     = { git = "https://github.com/Plonky3/Plonky3.git", rev = "64b3cc02b0fd547cb1a40ed52ead029548637ec4" }
+p3-commit        = { git = "https://github.com/Plonky3/Plonky3.git", rev = "64b3cc02b0fd547cb1a40ed52ead029548637ec4" }
+p3-sha256        = { git = "https://github.com/Plonky3/Plonky3.git", rev = "64b3cc02b0fd547cb1a40ed52ead029548637ec4" }
+ 
+# ── 기타 의존성 ──────────────────────────────────────────────────
+sha2       = "0.10"   # 네이티브 SHA-256 해시 비교용
+dhat       = "0.3"
+rand       = "0.10.1"
 num-traits = "0.2.19"
-p3-merkle-tree = { git = "https://github.com/Plonky3/Plonky3.git", version = "0.5.1" }
-p3-dft = { git = "https://github.com/Plonky3/Plonky3.git", version = "0.5.1" }
-p3-fri = { git = "https://github.com/Plonky3/Plonky3.git", version = "0.5.1" }
-p3-challenger = { git = "https://github.com/Plonky3/Plonky3.git", version = "0.5.1" }
-p3-uni-stark = { git = "https://github.com/Plonky3/Plonky3.git", version = "0.5.1" }
-p3-commit = "0.5.3"
-
+ 
 [dev-dependencies]
-criterion = "0.5"
-pprof = { version = "0.13", features = ["flamegraph", "criterion"] }
-rand = "0.10.1"
-rand_chacha = "0.3"
-
+criterion   = "0.5"
+pprof       = { version = "0.13", features = ["flamegraph", "criterion"] }
+rand        = "0.10.1"
+rand_chacha = "0.10"   # rand 0.10 과 짝이 되는 버전 (0.3 이면 rand_core 충돌)
+ 
 [[bench]]
 name = "hash_bench"
 harness = false
-
+ 
 [profile.bench]
 debug = true
-
+ 
 [profile.release]
 debug = 1 # dhat이 정확한 함수 위치를 추적하기 위해 필요
