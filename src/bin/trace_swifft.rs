@@ -2,6 +2,7 @@
 //
 // SWIFFT 전체 trace 생성 + 검증된 통합 AIR 로 prove/verify (AIR-1 완료)
 // + STARK 증명 생성 peak 힙 메모리 측정 (mem_prove_* 와 동일 기준).
+// + [추가] 게이트별 비용 분해 (논문 §"Why is SWIFFT expensive in STARK?")
 //
 // === 메모리 측정 관련 객관성 주의 (리포트에 반드시 명시) ===
 // 이 측정의 config 는 SWIFFT AIR 가 *실제로 요구하는 최소값* 이다:
@@ -13,6 +14,14 @@
 // 각 측정은 "그 회로가 실제 배포 시 요구하는 최소 config 에서의 진짜
 // 비용" 이며, 비교는 log_blowup/height 를 명시한 'config 보정 후'
 // 상대 해석으로만 유효하다. (JSON 에 log_blowup/height/cells 동시 기록.)
+//
+// === [추가] 게이트별 비용 분해 (cost breakdown) ===
+// 본 바이너리는 trace 생성 단계에서 각 게이트별 행 수를 카운트하고,
+// MULMOD 행을 용도별로 세분화한다(PSI twist / 점별 곱 / N_INV / PSI_INV).
+// 또한 "반사실 비용"을 추정한다: 모듈러스 257 ↔ BabyBear 미스매치로 인한
+// 비트 분해(r_low 8bit + r_top + k 8bit, 컬럼 5..13, 14..21 → 17개 컬럼)가
+// MULMOD 한 행의 width=48 중 얼마를 차지하는지. 이는 "SWIFFT 자체의 본질적
+// 비용" vs "필드 미스매치의 부수적 비용"을 분리하는 정량 근거가 된다.
 //
 // 한 행 = 하나의 게이트. G1 UNPACK / G2 MULMOD / G3 BFLY.
 // 출력 == SwifftHasherNaive(oracle) self-check 로 보장.
@@ -275,6 +284,47 @@ const SEL_MULMOD: usize = 1;
 const SEL_BFLY: usize = 2;
 const PB: usize = 3;
 
+// ============================================================
+//  [추가] 게이트별 비용 분해 (cost breakdown)
+// ============================================================
+//
+// MULMOD 행은 호출 위치에 따라 4가지 용도로 나뉜다.
+// AIR 제약은 모두 동일하지만, "어디서 발생하는 비용인지" 를 알면
+// SWIFFT 알고리즘의 어느 단계가 ZK 비용을 끌어올리는지 정량화할 수 있다.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum MulmodKind {
+    PsiTwist,    // x 청크의 PSI 비틀기 (16 청크 × 64 = 1024 행/블록)
+    PointwiseMul, // 키와 점별 곱 (16 청크 × 64 = 1024 행/블록)
+    NInvScale,   // 역NTT 후 N^{-1} 스케일링 (64 행/블록)
+    PsiInvUntwist, // 최종 PSI^{-1} 역비틀기 (64 행/블록)
+}
+
+#[derive(Default, Debug, Clone)]
+struct GateBreakdown {
+    unpack_rows: usize,
+    mulmod_rows_psi_twist: usize,
+    mulmod_rows_pointwise: usize,
+    mulmod_rows_ninv: usize,
+    mulmod_rows_psi_inv: usize,
+    bfly_rows_forward: usize,  // 정변환 NTT 의 버터플라이
+    bfly_rows_inverse: usize,  // 역변환 NTT 의 버터플라이
+}
+
+impl GateBreakdown {
+    fn mulmod_total(&self) -> usize {
+        self.mulmod_rows_psi_twist
+            + self.mulmod_rows_pointwise
+            + self.mulmod_rows_ninv
+            + self.mulmod_rows_psi_inv
+    }
+    fn bfly_total(&self) -> usize {
+        self.bfly_rows_forward + self.bfly_rows_inverse
+    }
+    fn total_rows(&self) -> usize {
+        self.unpack_rows + self.mulmod_total() + self.bfly_total()
+    }
+}
+
 #[inline]
 fn f(x: u32) -> BabyBear {
     BabyBear::new(x)
@@ -287,7 +337,11 @@ fn push_row(values: &mut Vec<BabyBear>, row: &[i32; W]) {
     }
 }
 
-fn g1_unpack(values: &mut Vec<BabyBear>, byte: u8) -> [i32; 4] {
+fn g1_unpack(
+    values: &mut Vec<BabyBear>,
+    byte: u8,
+    bd: &mut GateBreakdown,
+) -> [i32; 4] {
     let b = byte as i32;
     let cs = [b & 3, (b >> 2) & 3, (b >> 4) & 3, (b >> 6) & 3];
     let mut row = [0i32; W];
@@ -299,10 +353,17 @@ fn g1_unpack(values: &mut Vec<BabyBear>, byte: u8) -> [i32; 4] {
         row[PB + 6 + 2 * k] = cs[k] & 1;
     }
     push_row(values, &row);
+    bd.unpack_rows += 1;
     cs
 }
 
-fn g2_mulmod(values: &mut Vec<BabyBear>, u: i32, fac: i32) -> i32 {
+fn g2_mulmod(
+    values: &mut Vec<BabyBear>,
+    u: i32,
+    fac: i32,
+    bd: &mut GateBreakdown,
+    kind: MulmodKind,
+) -> i32 {
     let prod = u * fac;
     let k = prod / ntt::Q;
     let r = prod % ntt::Q;
@@ -322,10 +383,23 @@ fn g2_mulmod(values: &mut Vec<BabyBear>, u: i32, fac: i32) -> i32 {
     }
     row[PB + 13] = rt;
     push_row(values, &row);
+    match kind {
+        MulmodKind::PsiTwist => bd.mulmod_rows_psi_twist += 1,
+        MulmodKind::PointwiseMul => bd.mulmod_rows_pointwise += 1,
+        MulmodKind::NInvScale => bd.mulmod_rows_ninv += 1,
+        MulmodKind::PsiInvUntwist => bd.mulmod_rows_psi_inv += 1,
+    }
     r
 }
 
-fn g3_bfly(values: &mut Vec<BabyBear>, a: i32, b: i32, w: i32) -> (i32, i32) {
+fn g3_bfly(
+    values: &mut Vec<BabyBear>,
+    a: i32,
+    b: i32,
+    w: i32,
+    bd: &mut GateBreakdown,
+    inverse: bool,
+) -> (i32, i32) {
     let prod = w * b;
     let k1 = prod / ntt::Q;
     let v = prod % ntt::Q;
@@ -379,6 +453,11 @@ fn g3_bfly(values: &mut Vec<BabyBear>, a: i32, b: i32, w: i32) -> (i32, i32) {
     }
     row[PB + 44] = ht;
     push_row(values, &row);
+    if inverse {
+        bd.bfly_rows_inverse += 1;
+    } else {
+        bd.bfly_rows_forward += 1;
+    }
     (lo, hi)
 }
 
@@ -387,6 +466,8 @@ fn ntt_stage_traced(
     src: &[i32; N],
     tw: &[i32; N],
     l: usize,
+    bd: &mut GateBreakdown,
+    inverse: bool,
 ) -> [i32; N] {
     let m = N / (2 * l);
     let mut dst = [0i32; N];
@@ -395,7 +476,7 @@ fn ntt_stage_traced(
             let w = tw[j * m];
             let a = src[k * l + j];
             let b = src[k * l + j + N / 2];
-            let (lo, hi) = g3_bfly(values, a, b, w);
+            let (lo, hi) = g3_bfly(values, a, b, w, bd, inverse);
             dst[2 * k * l + j] = lo;
             dst[2 * k * l + j + l] = hi;
         }
@@ -403,7 +484,12 @@ fn ntt_stage_traced(
     dst
 }
 
-fn ntt_traced(values: &mut Vec<BabyBear>, a: &[i32; N], inverse: bool) -> [i32; N] {
+fn ntt_traced(
+    values: &mut Vec<BabyBear>,
+    a: &[i32; N],
+    inverse: bool,
+    bd: &mut GateBreakdown,
+) -> [i32; N] {
     let tw: &[i32; N] = if inverse {
         &ntt::OMEGA_INV_TABLE
     } else {
@@ -412,12 +498,12 @@ fn ntt_traced(values: &mut Vec<BabyBear>, a: &[i32; N], inverse: bool) -> [i32; 
     let mut s = *a;
     let mut l = 1;
     for _ in 0..LOG_N {
-        s = ntt_stage_traced(values, &s, tw, l);
+        s = ntt_stage_traced(values, &s, tw, l, bd, inverse);
         l <<= 1;
     }
     if inverse {
         for j in 0..N {
-            s[j] = g2_mulmod(values, s[j], ntt::N_INV);
+            s[j] = g2_mulmod(values, s[j], ntt::N_INV, bd, MulmodKind::NInvScale);
         }
     }
     s
@@ -427,6 +513,7 @@ fn swifft_block_traced(
     values: &mut Vec<BabyBear>,
     data: &[u8],
     keys: &[[i32; N]; M],
+    bd: &mut GateBreakdown,
 ) -> [i32; N] {
     let mut keys_ntt = [[0i32; N]; M];
     for i in 0..M {
@@ -443,31 +530,35 @@ fn swifft_block_traced(
         let chunk = &data[i * 16..(i + 1) * 16];
         let mut x = [0i32; N];
         for (jb, &byte) in chunk.iter().enumerate() {
-            let cs = g1_unpack(values, byte);
+            let cs = g1_unpack(values, byte, bd);
             x[jb * 4..jb * 4 + 4].copy_from_slice(&cs);
         }
         let mut xt = [0i32; N];
         for j in 0..N {
-            xt[j] = g2_mulmod(values, x[j], ntt::PSI_TABLE[j]);
+            xt[j] = g2_mulmod(values, x[j], ntt::PSI_TABLE[j], bd, MulmodKind::PsiTwist);
         }
-        let xf = ntt_traced(values, &xt, false);
+        let xf = ntt_traced(values, &xt, false, bd);
         for j in 0..N {
-            let p = g2_mulmod(values, xf[j], keys_ntt[i][j]);
+            let p = g2_mulmod(values, xf[j], keys_ntt[i][j], bd, MulmodKind::PointwiseMul);
             acc[j] += p;
         }
     }
     for j in 0..N {
         acc[j] = acc[j].rem_euclid(ntt::Q);
     }
-    let c = ntt_traced(values, &acc, true);
+    let c = ntt_traced(values, &acc, true, bd);
     let mut out = [0i32; N];
     for j in 0..N {
-        out[j] = g2_mulmod(values, c[j], ntt::PSI_INV_TABLE[j]);
+        out[j] = g2_mulmod(values, c[j], ntt::PSI_INV_TABLE[j], bd, MulmodKind::PsiInvUntwist);
     }
     out
 }
 
-fn generate_swifft_trace(data: &[u8], keys: &[[i32; N]; M]) -> RowMajorMatrix<BabyBear> {
+fn generate_swifft_trace(
+    data: &[u8],
+    keys: &[[i32; N]; M],
+    bd: &mut GateBreakdown,
+) -> RowMajorMatrix<BabyBear> {
     assert!(
         data.len() % 256 == 0 && !data.is_empty(),
         "input must be a non-empty multiple of 256 bytes"
@@ -476,7 +567,12 @@ fn generate_swifft_trace(data: &[u8], keys: &[[i32; N]; M]) -> RowMajorMatrix<Ba
     let mut values: Vec<BabyBear> = Vec::with_capacity(num_blocks * 5700 * W);
 
     for blk in 0..num_blocks {
-        let _ = swifft_block_traced(&mut values, &data[blk * 256..(blk + 1) * 256], keys);
+        let _ = swifft_block_traced(
+            &mut values,
+            &data[blk * 256..(blk + 1) * 256],
+            keys,
+            bd,
+        );
     }
 
     let rows_filled = values.len() / W;
@@ -492,6 +588,231 @@ fn generate_swifft_trace(data: &[u8], keys: &[[i32; N]; M]) -> RowMajorMatrix<Ba
     }
 
     RowMajorMatrix::new(values, W)
+}
+
+// ============================================================
+//  [추가] 비용 분해 리포트 출력
+// ============================================================
+//
+// 각 게이트가 width=48 컬럼 중 "필드 미스매치(모듈러스 257 ↔ BabyBear)"
+// 때문에 강제되는 컬럼을 얼마나 쓰는지 정량화한다.
+//
+// G2 MULMOD (width=48):
+//   - 산술 본질: u, f, prod, k, r (컬럼 PB..PB+4)              → 5 컬럼
+//   - 모듈러 환원 강제 비트분해:
+//       r_low 8bit + r_top + k 8bit (컬럼 PB+5..PB+21)         → 17 컬럼
+//   - 미사용 패딩 (컬럼 PB+22..)                                → 나머지
+//   * selector 3 컬럼 + 본질 5 = 정직한 "산술 비용" 8 컬럼
+//   * 17 컬럼이 q=257 ≠ BabyBear 미스매치로 인한 부수 비용
+//
+// G3 BFLY (width=48):
+//   - 산술 본질: a, b, w, prod, k1, v, lo, hi, flo, fhi      → 10 컬럼
+//   - 비트분해 (v, k1, lo, hi 각 8bit + top):
+//       (10..18 v_low8 + 18 v_top) + (19..27 k1_8) +
+//       (27..35 lo_low8 + 35 lo_top) + (36..44 hi_low8 + 44 hi_top)
+//                                                            → 34 컬럼
+//   * 산술 본질 10 + selector 3 = 13 컬럼
+//   * 34 컬럼이 미스매치로 인한 부수 비용
+//
+// 이 분해는 "SWIFFT 알고리즘 자체의 본질적 ZK 비용" 과
+// "필드 미스매치의 부수적 비용" 을 정량적으로 분리한다.
+// 논문의 핵심 통찰: ZK 친화 격자 해시 설계 시 필드 정합성이 1순위 변수.
+
+const MULMOD_INTRINSIC_COLS: usize = 5;       // u, f, prod, k, r
+const MULMOD_MISMATCH_COLS: usize = 17;       // r_low8 + r_top + k8
+const BFLY_INTRINSIC_COLS: usize = 10;        // a,b,w,prod,k1,v,lo,hi,flo,fhi
+const BFLY_MISMATCH_COLS: usize = 34;         // v/k1/lo/hi 각 비트분해 + top
+const UNPACK_INTRINSIC_COLS: usize = 13;      // byte + 4 coeff + 4×(hi,lo)
+const SELECTOR_COLS: usize = 3;               // su, sm, sb
+
+fn print_cost_breakdown(bd: &GateBreakdown, num_blocks: usize, padded_rows: usize) {
+    let total_logical = bd.total_rows();
+    let padding_rows = padded_rows - total_logical;
+
+    println!("\n┌──────────────────────────────────────────────────────────┐");
+    println!(  "│  Gate-level Cost Breakdown (논문 §Analysis 용)            │");
+    println!(  "└──────────────────────────────────────────────────────────┘");
+    println!("Input: {num_blocks} block(s) × 256 B = {} B", num_blocks * 256);
+    println!("Logical rows (no padding): {total_logical}");
+    println!("Padded rows (next_pow2):   {padded_rows}");
+    println!("Padding overhead:          {padding_rows} rows ({:.1}%)",
+             100.0 * padding_rows as f64 / padded_rows as f64);
+    println!();
+
+    // 행 수 분해
+    println!("── Row counts by gate ──");
+    println!("  G1 UNPACK            : {:>8} rows ({:>5.1}%)",
+             bd.unpack_rows,
+             100.0 * bd.unpack_rows as f64 / total_logical as f64);
+    println!("  G2 MULMOD (total)    : {:>8} rows ({:>5.1}%)",
+             bd.mulmod_total(),
+             100.0 * bd.mulmod_total() as f64 / total_logical as f64);
+    println!("    ├─ PSI twist       : {:>8} rows (input pre-twist)",
+             bd.mulmod_rows_psi_twist);
+    println!("    ├─ pointwise mul   : {:>8} rows (key × x in NTT domain)",
+             bd.mulmod_rows_pointwise);
+    println!("    ├─ N^{{-1}} scale     : {:>8} rows (post-INTT)",
+             bd.mulmod_rows_ninv);
+    println!("    └─ PSI^{{-1}} untwist : {:>8} rows (final untwist)",
+             bd.mulmod_rows_psi_inv);
+    println!("  G3 BFLY (total)      : {:>8} rows ({:>5.1}%)",
+             bd.bfly_total(),
+             100.0 * bd.bfly_total() as f64 / total_logical as f64);
+    println!("    ├─ forward NTT     : {:>8} rows (M chunks × 6 stages × 32)",
+             bd.bfly_rows_forward);
+    println!("    └─ inverse NTT     : {:>8} rows (1 INTT × 6 stages × 32)",
+             bd.bfly_rows_inverse);
+    println!();
+
+    // 셀 수 분해 (padding 포함)
+    let unpack_cells = bd.unpack_rows * W;
+    let mulmod_cells = bd.mulmod_total() * W;
+    let bfly_cells   = bd.bfly_total() * W;
+    let padding_cells = padding_rows * W;
+    let total_cells = padded_rows * W;
+
+    println!("── Cell counts by gate (width={W}) ──");
+    println!("  G1 UNPACK            : {:>10} cells ({:>5.1}%)",
+             unpack_cells, 100.0 * unpack_cells as f64 / total_cells as f64);
+    println!("  G2 MULMOD            : {:>10} cells ({:>5.1}%)",
+             mulmod_cells, 100.0 * mulmod_cells as f64 / total_cells as f64);
+    println!("  G3 BFLY              : {:>10} cells ({:>5.1}%)",
+             bfly_cells, 100.0 * bfly_cells as f64 / total_cells as f64);
+    println!("  padding (next_pow2)  : {:>10} cells ({:>5.1}%)",
+             padding_cells, 100.0 * padding_cells as f64 / total_cells as f64);
+    println!("  ─────────────────────  ──────────");
+    println!("  TOTAL                : {:>10} cells", total_cells);
+    println!();
+
+    // ── 핵심: 필드 미스매치 vs 산술 본질 분해 ──
+    //
+    // 각 게이트의 컬럼을 "산술 본질" + "필드 미스매치 비트분해" + "selector"
+    // 로 나눠 셀 수를 재합산한다. selector 컬럼은 미스매치와 무관하지만,
+    // unified AIR 의 soundness 를 위해 필수이므로 별도 카운트.
+    let unpack_intrinsic = bd.unpack_rows * UNPACK_INTRINSIC_COLS;
+    let mulmod_intrinsic = bd.mulmod_total() * MULMOD_INTRINSIC_COLS;
+    let mulmod_mismatch  = bd.mulmod_total() * MULMOD_MISMATCH_COLS;
+    let bfly_intrinsic   = bd.bfly_total() * BFLY_INTRINSIC_COLS;
+    let bfly_mismatch    = bd.bfly_total() * BFLY_MISMATCH_COLS;
+    let selector_cells   = total_logical * SELECTOR_COLS;
+    // 나머지 컬럼은 미사용 패딩 (각 게이트가 width=48 을 다 못 채움).
+    let unused_cells = total_logical * W
+        - (unpack_intrinsic + mulmod_intrinsic + mulmod_mismatch
+            + bfly_intrinsic + bfly_mismatch + selector_cells);
+
+    let intrinsic_total = unpack_intrinsic + mulmod_intrinsic + bfly_intrinsic;
+    let mismatch_total  = mulmod_mismatch + bfly_mismatch;
+
+    println!("── Counterfactual cell decomposition (논문 핵심) ──");
+    println!("각 게이트의 컬럼을 '산술 본질' vs '필드 미스매치 비트분해' 로 분리:");
+    println!();
+    println!("  Intrinsic (SWIFFT 본질 산술) :");
+    println!("    UNPACK byte→2bit×4  : {:>10} cells", unpack_intrinsic);
+    println!("    MULMOD u,f,prod,k,r : {:>10} cells", mulmod_intrinsic);
+    println!("    BFLY   a,b,w,...,fhi: {:>10} cells", bfly_intrinsic);
+    println!("    ─────────────────────  ──────────");
+    println!("    subtotal            : {:>10} cells ({:>5.1}%)",
+             intrinsic_total, 100.0 * intrinsic_total as f64 / total_cells as f64);
+    println!();
+    println!("  Mismatch (q=257 ≠ BabyBear 비트분해 강제):");
+    println!("    MULMOD r_low+r_top+k: {:>10} cells", mulmod_mismatch);
+    println!("    BFLY   v/k1/lo/hi 분해: {:>10} cells", bfly_mismatch);
+    println!("    ─────────────────────  ──────────");
+    println!("    subtotal            : {:>10} cells ({:>5.1}%)",
+             mismatch_total, 100.0 * mismatch_total as f64 / total_cells as f64);
+    println!();
+    println!("  Selector (unified AIR soundness):");
+    println!("    su, sm, sb          : {:>10} cells ({:>5.1}%)",
+             selector_cells, 100.0 * selector_cells as f64 / total_cells as f64);
+    println!();
+    println!("  Unused / row-padding within width:");
+    println!("    (각 게이트가 width=48 을 다 채우지 못함):");
+    println!("                        : {:>10} cells ({:>5.1}%)",
+             unused_cells, 100.0 * unused_cells as f64 / total_cells as f64);
+    println!("  Pow2 row padding (NOP rows):");
+    println!("                        : {:>10} cells ({:>5.1}%)",
+             padding_cells, 100.0 * padding_cells as f64 / total_cells as f64);
+    println!();
+
+    // ── 반사실 추정: 만약 모듈러스가 BabyBear 호환이었다면? ──
+    //
+    // 가정: q 가 BabyBear 내부에서 자연스럽게 다뤄지면 MULMOD/BFLY 의 비트
+    // 분해 컬럼이 불필요 (Poseidon2 처럼 산술 본질만 남음). 이때 width 는
+    // 줄어들고 selector 3 컬럼은 여전히 필요. 가장 큰 게이트(BFLY)의 본질
+    // 컬럼 10 을 width 로 가정한 보수적 추정.
+    let counterfactual_width = BFLY_INTRINSIC_COLS + SELECTOR_COLS; // 10 + 3 = 13
+    let counterfactual_rows = total_logical; // 행 수는 동일 (산술 구조 불변)
+    // counterfactual_rows 는 padding 전이고, next_pow2 padding 은 width 와
+    // 무관하게 동일하게 적용된다 (행 단위 padding 이므로).
+    let counterfactual_padded_rows = counterfactual_rows.next_power_of_two();
+    let counterfactual_cells = counterfactual_padded_rows * counterfactual_width;
+
+    println!("── Counterfactual: BabyBear-friendly modulus 가정 시 ──");
+    println!("(가정: q 가 BabyBear 내부에서 자연스럽다면 비트분해 컬럼 제거 가능)");
+    println!("  추정 width  : {counterfactual_width} (BFLY 본질 {BFLY_INTRINSIC_COLS} + selector {SELECTOR_COLS})");
+    println!("  추정 rows   : {counterfactual_padded_rows} (구조 동일)");
+    println!("  추정 cells  : {counterfactual_cells}");
+    println!("  현재 cells  : {total_cells}");
+    println!("  추정 절감률 : {:.1}× ({:.1}% reduction)",
+             total_cells as f64 / counterfactual_cells as f64,
+             100.0 * (1.0 - counterfactual_cells as f64 / total_cells as f64));
+    println!();
+    println!("주의: 이 반사실은 '필드 미스매치가 제거된 *동일 알고리즘*'의 상한선.");
+    println!("       실제 BabyBear 친화 격자 해시는 알고리즘 자체도 재설계되어");
+    println!("       추가 절감이 가능할 수 있다. 본 추정은 보수적 lower bound.");
+
+    // JSON 부분 갱신 (논문/대시보드에서 활용)
+    write_breakdown_json(bd, padded_rows, total_cells, counterfactual_cells);
+}
+
+fn write_breakdown_json(
+    bd: &GateBreakdown,
+    padded_rows: usize,
+    total_cells: usize,
+    counterfactual_cells: usize,
+) {
+    let path = "swifft_cost_breakdown.json";
+    // 단순 JSON 직접 작성 (serde 없이).
+    let json = format!(
+        "{{\n\
+         \"unpack_rows\": {},\n\
+         \"mulmod_rows_total\": {},\n\
+         \"mulmod_rows_psi_twist\": {},\n\
+         \"mulmod_rows_pointwise\": {},\n\
+         \"mulmod_rows_ninv\": {},\n\
+         \"mulmod_rows_psi_inv\": {},\n\
+         \"bfly_rows_total\": {},\n\
+         \"bfly_rows_forward\": {},\n\
+         \"bfly_rows_inverse\": {},\n\
+         \"total_logical_rows\": {},\n\
+         \"padded_rows\": {},\n\
+         \"width\": {},\n\
+         \"total_cells\": {},\n\
+         \"counterfactual_cells_no_mismatch\": {},\n\
+         \"counterfactual_reduction_factor\": {:.3},\n\
+         \"_note\": \"counterfactual = if modulus were BabyBear-friendly, eliminating bit-decomposition columns. Conservative lower bound.\"\n\
+         }}\n",
+        bd.unpack_rows,
+        bd.mulmod_total(),
+        bd.mulmod_rows_psi_twist,
+        bd.mulmod_rows_pointwise,
+        bd.mulmod_rows_ninv,
+        bd.mulmod_rows_psi_inv,
+        bd.bfly_total(),
+        bd.bfly_rows_forward,
+        bd.bfly_rows_inverse,
+        bd.total_rows(),
+        padded_rows,
+        W,
+        total_cells,
+        counterfactual_cells,
+        total_cells as f64 / counterfactual_cells as f64,
+    );
+    if let Err(e) = fs::write(path, json) {
+        eprintln!("⚠️  Failed to write {path}: {e}");
+    } else {
+        println!("\n💾 Wrote cost breakdown to {path}");
+    }
 }
 
 fn main() {
@@ -515,7 +836,8 @@ fn main() {
             *b = ((idx * 7 + 13) & 0xFF) as u8;
         }
         let mut scratch: Vec<BabyBear> = Vec::new();
-        let got = swifft_block_traced(&mut scratch, &probe, &keys);
+        let mut scratch_bd = GateBreakdown::default();
+        let got = swifft_block_traced(&mut scratch, &probe, &keys, &mut scratch_bd);
 
         let naive = SwifftHasherNaive {
             keys: core::array::from_fn(|i| {
@@ -545,15 +867,21 @@ fn main() {
         println!("[self-check] trace witness == SwifftHasherNaive oracle: OK");
     }
 
-    let trace = generate_swifft_trace(&data, &keys);
+    // ── 실제 trace 생성 (게이트별 카운트 활성화) ──
+    let mut breakdown = GateBreakdown::default();
+    let trace = generate_swifft_trace(&data, &keys, &mut breakdown);
     let width = trace.width();
     let height = trace.height();
     let total_cells = width * height;
+    let num_blocks = data.len() / 256;
 
-    println!("Trace generated for 1KB ({} blocks).", data.len() / 256);
+    println!("\nTrace generated for {} B ({} blocks).", data.len(), num_blocks);
     println!("Dimensions: {height} rows x {width} cols");
     println!("Trace Size (cells): {total_cells}");
     println!("(Key NTT excluded from witness — keys are public constants.)");
+
+    // ── [추가] 게이트별 비용 분해 출력 ──
+    print_cost_breakdown(&breakdown, num_blocks, height);
 
     // ── prove → (peak 메모리 측정) → verify ──
     {
@@ -563,8 +891,6 @@ fn main() {
 
         let before = dhat::HeapStats::get();
         let proof = prove::<MyConfig, _>(&config, &air, trace, &[]);
-        // prove 직후 / verify 직전에 측정 → verify 메모리를 peak 해석에서 분리.
-        // (max_bytes 는 누적 peak 이나 SWIFFT 는 prove ≫ verify 라 실용상 무방.)
         let after_prove = dhat::HeapStats::get();
         black_box(&proof);
 
@@ -593,8 +919,6 @@ fn main() {
         println!("Prove-section cumulative alloc:   {prove_alloc_delta} bytes");
 
         // ── memory_results.json 부분 갱신 (SWIFFT 키 + config 메타) ──
-        // SWIFFT 3 변종은 ZK 회로가 동일하므로 같은 peak 값을 공유한다
-        // (네이티브 속도만 변종별로 다름; 회로/메모리는 동일 AIR).
         let path = "memory_results.json";
         let mut map = match fs::read_to_string(path) {
             Ok(s) => parse_simple_json(&s),
@@ -604,7 +928,6 @@ fn main() {
         for key in ["SWIFFT-Naive", "SWIFFT-Scalar", "SWIFFT-AVX2"] {
             map.insert(key.to_string(), JVal::Num(kb));
         }
-        // config 보정용 메타데이터 — 절대 비교 방지, 리포트 근거.
         map.insert("_swifft_log_blowup".to_string(), JVal::Num(SWIFFT_LOG_BLOWUP as i64));
         map.insert("_swifft_height".to_string(), JVal::Num(height as i64));
         map.insert("_swifft_cells".to_string(), JVal::Num(total_cells as i64));

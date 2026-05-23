@@ -1,7 +1,7 @@
 {
   "SHA-256-style bitwise circuit": 1589248,
-  "Keccak": 86278144,
-  "Poseidon2": 4882432,
+  "Keccak": 674048,
+  "Poseidon2": 9536,
   "SWIFFT-AVX2": 1572864,
   "SWIFFT-Naive": 1572864,
   "SWIFFT-Scalar": 1572864

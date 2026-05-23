@@ -1,0 +1,18 @@
+{
+"unpack_rows": 1024,
+"mulmod_rows_total": 8704,
+"mulmod_rows_psi_twist": 4096,
+"mulmod_rows_pointwise": 4096,
+"mulmod_rows_ninv": 256,
+"mulmod_rows_psi_inv": 256,
+"bfly_rows_total": 13056,
+"bfly_rows_forward": 12288,
+"bfly_rows_inverse": 768,
+"total_logical_rows": 22784,
+"padded_rows": 32768,
+"width": 48,
+"total_cells": 1572864,
+"counterfactual_cells_no_mismatch": 425984,
+"counterfactual_reduction_factor": 3.692,
+"_note": "counterfactual = if modulus were BabyBear-friendly, eliminating bit-decomposition columns. Conservative lower bound."
+}
